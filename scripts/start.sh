@@ -29,3 +29,4 @@ echo $! > "$PID_FILE"
 echo "Started Uvicorn (PID $(cat "$PID_FILE")) on 0.0.0.0:3000"
 
 
+

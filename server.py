@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from PIL import Image
 from ultralytics import YOLO
 try:
@@ -274,6 +274,277 @@ async def infer(
     }
 
     return JSONResponse(content=response)
+
+
+@app.get("/", response_class=HTMLResponse)
+async def upload_page():
+    html = """
+    <!doctype html>
+    <html lang=\"en\">
+    <head>
+      <meta charset=\"utf-8\" />
+      <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+      <title>Axsy Inference Demo</title>
+      <style>
+        :root { color-scheme: light dark; }
+        body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica, Arial, \"Apple Color Emoji\", \"Segoe UI Emoji\"; margin: 0; padding: 24px; }
+        h1 { margin: 0 0 12px; font-size: 20px; }
+        .card { max-width: 1100px; margin: 0 auto; display: grid; grid-template-columns: 360px 1fr; gap: 24px; align-items: start; }
+        .panel { border: 1px solid #9993; border-radius: 12px; padding: 16px; background: #fff2; backdrop-filter: blur(3px); }
+        label { display: block; font-size: 12px; opacity: 0.8; margin: 10px 0 6px; }
+        input[type=\"text\"], input[type=\"file\"], select { width: 100%; padding: 8px; border-radius: 8px; border: 1px solid #9996; background: transparent; }
+        button { padding: 10px 14px; border-radius: 10px; border: 1px solid #6666; cursor: pointer; background: #0a7; color: white; font-weight: 600; }
+        button:disabled { opacity: 0.6; cursor: not-allowed; }
+        .media { position: relative; max-width: 100%; }
+        .media img { max-width: 100%; height: auto; display: block; border-radius: 10px; }
+        canvas { position: absolute; left: 0; top: 0; pointer-events: none; }
+        .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+        .details { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\", monospace; font-size: 12px; white-space: pre; background: #0000000b; border-radius: 10px; padding: 12px; overflow: auto; }
+        .kv { display: grid; grid-template-columns: 180px 1fr; gap: 8px; font-size: 13px; }
+        .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; border: 1px solid #9996; margin-right: 6px; }
+      </style>
+    </head>
+    <body>
+      <h1>Axsy Inference Demo</h1>
+      <div class=\"card\">
+        <div class=\"panel\">
+          <form id=\"form\">
+            <label>Image</label>
+            <input id=\"file\" name=\"file\" type=\"file\" accept=\"image/*\" required />
+
+            <label>Classifier (model path or gs:// or blob path)</label>
+            <input id=\"classifier\" type=\"text\" placeholder=\"e.g. axsy-yolo.pt or gs://bucket/model.pt\" />
+
+            <div class=\"row\">
+              <div>
+                <label>GCS bucket header</label>
+                <input id=\"gcs_bucket\" type=\"text\" placeholder=\"bucket-name (optional)\" />
+              </div>
+              <div>
+                <label>Customer ID</label>
+                <input id=\"customer_id\" type=\"text\" placeholder=\"optional\" />
+              </div>
+            </div>
+            <div class=\"row\">
+              <div>
+                <label>Model ID</label>
+                <input id=\"model_id\" type=\"text\" placeholder=\"optional\" />
+              </div>
+              <div>
+                <label>Project ID</label>
+                <input id=\"project_id\" type=\"text\" placeholder=\"optional\" />
+              </div>
+            </div>
+
+            <div style=\"display:flex; gap: 12px; align-items:center; margin-top:12px; flex-wrap: wrap;\">
+              <button id=\"run\" type=\"submit\">Run inference</button>
+              <label style=\"display:flex; gap:6px; align-items:center; margin:0;\"><input id=\"show_labels\" type=\"checkbox\" checked /> Show labels</label>
+              <label style=\"display:flex; gap:8px; align-items:center; margin:0;\">
+                Overlay scale
+                <input id=\"overlay_scale\" type=\"range\" min=\"0.5\" max=\"1.5\" step=\"0.05\" value=\"0.8\" />
+                <span id=\"overlay_scale_value\">0.8x</span>
+              </label>
+            </div>
+          </form>
+        </div>
+
+        <div class=\"panel\">
+          <div class=\"media\" id=\"media\" style=\"display:none\;\">
+            <img id=\"img\" alt=\"uploaded image\" />
+            <canvas id=\"overlay\"></canvas>
+          </div>
+          <div id=\"meta\" style=\"margin-top:12px\; display:none\;\"></div>
+          <div id=\"details\" class=\"details\" style=\"display:none\;\"></div>
+        </div>
+      </div>
+
+      <script>
+        const form = document.getElementById('form');
+        const inputFile = document.getElementById('file');
+        const runBtn = document.getElementById('run');
+        const imgEl = document.getElementById('img');
+        const canvas = document.getElementById('overlay');
+        const media = document.getElementById('media');
+        const meta = document.getElementById('meta');
+        const details = document.getElementById('details');
+        const showLabels = document.getElementById('show_labels');
+        const overlayScale = document.getElementById('overlay_scale');
+        const overlayScaleValue = document.getElementById('overlay_scale_value');
+
+        function hashString(str) {
+          let h = 0;
+          for (let i = 0; i < str.length; i++) h = ((h << 5) - h + str.charCodeAt(i)) | 0;
+          return h >>> 0;
+        }
+        function getClassHueMap(result) {
+          const names = new Set(Object.keys(result.class_counts || {}));
+          if ((!names || names.size === 0) && Array.isArray(result.detections)) {
+            for (const det of result.detections) names.add(det.class_name);
+          }
+          const sorted = Array.from(names).sort();
+          const n = Math.max(1, sorted.length);
+          const map = {};
+          for (let i = 0; i < sorted.length; i++) {
+            // Evenly spaced hues with some offset for nicer defaults
+            const hue = (i * 360 / n + 10) % 360;
+            map[sorted[i]] = hue;
+          }
+          return map;
+        }
+        function colorForClass(name, alpha, hueMap) {
+          const hue = hueMap && name in hueMap ? hueMap[name] : (hashString(String(name)) % 360);
+          return `hsla(${hue}, 80%, 50%, ${alpha})`;
+        }
+
+        function clearOutput() {
+          media.style.display = 'none';
+          meta.style.display = 'none';
+          details.style.display = 'none';
+          const ctx = canvas.getContext('2d');
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+        }
+
+        function fmt(n) { return typeof n === 'number' ? n.toFixed(1) : n; }
+
+        function drawDetections(imageDisplayWidth, imageDisplayHeight, response) {
+          canvas.width = imageDisplayWidth;
+          canvas.height = imageDisplayHeight;
+          const ctx = canvas.getContext('2d');
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+          const iw = response.result.image.width || imageDisplayWidth;
+          const ih = response.result.image.height || imageDisplayHeight;
+          const scaleX = imageDisplayWidth / iw;
+          const scaleY = imageDisplayHeight / ih;
+
+          const scaleFactor = overlayScale ? parseFloat(overlayScale.value) : 0.8;
+          const baseLine = Math.max(1, Math.min(imageDisplayWidth, imageDisplayHeight) * 0.0012);
+          const lineWidth = Math.max(1, baseLine * scaleFactor);
+          ctx.lineWidth = lineWidth;
+          const baseFont = Math.max(9, Math.round(imageDisplayWidth * 0.012));
+          const fontPx = Math.max(9, Math.round(baseFont * scaleFactor));
+          ctx.font = `${fontPx}px ui-monospace, monospace`;
+          ctx.textBaseline = 'top';
+
+          const hueMap = getClassHueMap(response.result);
+          for (const det of response.result.detections) {
+            const [x1, y1, x2, y2] = det.box.xyxy;
+            const rx1 = x1 * scaleX, ry1 = y1 * scaleY, rx2 = x2 * scaleX, ry2 = y2 * scaleY;
+            const w = rx2 - rx1, h = ry2 - ry1;
+            const strokeColor = colorForClass(det.class_name, 1.0, hueMap);
+            ctx.strokeStyle = strokeColor;
+            ctx.strokeRect(rx1, ry1, w, h);
+
+            if (showLabels.checked) {
+              const label = `${det.class_name} ${fmt(det.confidence * 100)}%`;
+              const padX = 6, padY = 3;
+              const tw = ctx.measureText(label).width + padX * 2;
+              const th = fontPx + padY * 2;
+              const bx = Math.max(0, Math.min(rx1, imageDisplayWidth - tw));
+              const by = Math.max(0, ry1 - th - 2);
+              ctx.fillStyle = colorForClass(det.class_name, 0.85, hueMap);
+              ctx.fillRect(bx, by, tw, th);
+              ctx.fillStyle = '#fff';
+              ctx.fillText(label, bx + padX, by + padY);
+            }
+          }
+        }
+
+        function renderMeta(response) {
+          const r = response.result;
+          const speed = r.speed_ms || {}; 
+          const pills = Object.entries(r.class_counts || {}).map(([k,v]) => `<span class=\"pill\">${k}: ${v}</span>`).join(' ');
+          meta.innerHTML = `
+            <div class=\"kv\">
+              <div>Detections</div><div><strong>${r.num_detections}</strong></div>
+              <div>Image</div><div>${r.image.width} × ${r.image.height}</div>
+              <div>Speed (ms)</div><div>pre: ${fmt(speed.preprocess)} · infer: ${fmt(speed.inference)} · post: ${fmt(speed.postprocess)}</div>
+              <div>Classes</div><div>${pills || '—'}</div>
+            </div>
+          `;
+          meta.style.display = 'block';
+        }
+
+        function renderDetails(response) {
+          details.textContent = JSON.stringify(response, null, 2);
+          details.style.display = 'block';
+        }
+
+        async function runInference(evt) {
+          evt.preventDefault();
+          clearOutput();
+          const file = inputFile.files && inputFile.files[0];
+          if (!file) return;
+          runBtn.disabled = true;
+          try {
+            const formData = new FormData();
+            formData.append('file', file);
+
+            const headers = {};
+            const classifier = document.getElementById('classifier').value.trim();
+            const gcs_bucket = document.getElementById('gcs_bucket').value.trim();
+            const customer_id = document.getElementById('customer_id').value.trim();
+            const model_id = document.getElementById('model_id').value.trim();
+            const project_id = document.getElementById('project_id').value.trim();
+            if (classifier) headers['classifier'] = classifier;
+            if (gcs_bucket) headers['gcs_bucket'] = gcs_bucket;
+            if (customer_id) headers['customer_id'] = customer_id;
+            if (model_id) headers['model_id'] = model_id;
+            if (project_id) headers['project_id'] = project_id;
+
+            const resp = await fetch('/infer', { method: 'POST', body: formData, headers });
+            if (!resp.ok) {
+              const text = await resp.text();
+              throw new Error(`HTTP ${resp.status}: ${text}`);
+            }
+            const data = await resp.json();
+
+            // Show image
+            imgEl.src = URL.createObjectURL(file);
+            await imgEl.decode().catch(() => {});
+            media.style.display = 'block';
+            // Force canvas to follow displayed size
+            canvas.style.width = imgEl.clientWidth + 'px';
+            canvas.style.height = imgEl.clientHeight + 'px';
+            drawDetections(imgEl.clientWidth, imgEl.clientHeight, data);
+            renderMeta(data);
+            renderDetails(data);
+          } catch (err) {
+            details.textContent = String(err);
+            details.style.display = 'block';
+          } finally {
+            runBtn.disabled = false;
+          }
+        }
+
+        form.addEventListener('submit', runInference);
+        showLabels.addEventListener('change', () => {
+          if (media.style.display !== 'none') {
+            try { details.textContent && JSON.parse(details.textContent); } catch { return; }
+            // If we have JSON, redraw using it
+            try {
+              const data = JSON.parse(details.textContent);
+              drawDetections(imgEl.clientWidth, imgEl.clientHeight, data);
+            } catch {}
+          }
+        });
+        if (overlayScale && overlayScaleValue) {
+          overlayScaleValue.textContent = overlayScale.value + 'x';
+          overlayScale.addEventListener('input', () => {
+            overlayScaleValue.textContent = overlayScale.value + 'x';
+            if (media.style.display !== 'none') {
+              try {
+                const data = JSON.parse(details.textContent);
+                drawDetections(imgEl.clientWidth, imgEl.clientHeight, data);
+              } catch {}
+            }
+          });
+        }
+      </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
 
 
 def get_app():
