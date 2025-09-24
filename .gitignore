@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+*.pyc
+
+# Node/General
+node_modules/
+.DS_Store
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Logs
+uvicorn.log
+*.log
+
+# Secrets and credentials
+smart-vision-trainiing-sa.json
+.env
+.env.*
+
+# Large model files
+*.pt
+*.onnx
+*.tflite
+
+# Local test assets
+test.jpg
+test2.png
+
+
