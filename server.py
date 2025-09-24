@@ -1,10 +1,12 @@
 import io
 import json
 import os
+import threading
 from functools import lru_cache
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from PIL import Image
 from ultralytics import YOLO
@@ -16,10 +18,19 @@ except Exception:
 
 app = FastAPI(title="Axsy Inference API")
 
+# Global locks for concurrency safety
+_global_lock = threading.Lock()
+_download_locks: Dict[str, threading.Lock] = {}
+_model_locks: Dict[str, threading.Lock] = {}
 
-def set_google_credentials_from_file(path: str) -> None:
-    if path and os.path.isfile(path):
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = path
+
+def _get_lock(lock_map: Dict[str, threading.Lock], key: str) -> threading.Lock:
+    with _global_lock:
+        lock = lock_map.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            lock_map[key] = lock
+        return lock
 
 
 @lru_cache(maxsize=8)
@@ -62,12 +73,13 @@ def _download_blob_to_cache(bucket_name: str, blob_path: str, project_id: Option
     filename = os.path.basename(blob_path) or "model.pt"
     local_path = os.path.join(cache_dir, filename)
 
-    # If file already cached, use it as-is
-    if os.path.isfile(local_path) and os.path.getsize(local_path) > 0:
+    # Serialize downloads per file to avoid races
+    lock = _get_lock(_download_locks, local_path)
+    with lock:
+        if os.path.isfile(local_path) and os.path.getsize(local_path) > 0:
+            return local_path
+        blob.download_to_filename(local_path)
         return local_path
-
-    blob.download_to_filename(local_path)
-    return local_path
 
 
 def resolve_model_path(
@@ -190,6 +202,17 @@ def run_yolo_inference(model: YOLO, pil_image: Image.Image):
     }
 
 
+def _run_inference_threadsafe(model_path: str, model: YOLO, pil_image: Image.Image) -> Dict[str, Any]:
+    """Run inference under a per-model lock to ensure thread-safety.
+
+    This prevents concurrent model() calls on the same model instance which
+    can be unsafe with some backends (e.g., GPU execution).
+    """
+    lock = _get_lock(_model_locks, model_path)
+    with lock:
+        return run_yolo_inference(model, pil_image)
+
+
 @app.post("/infer")
 async def infer(
     request: Request,
@@ -201,10 +224,6 @@ async def infer(
     classifier: Optional[str] = Header(default=None, description="Relative or absolute model path"),
     gcs_bucket: Optional[str] = Header(default=None, description="GCS bucket containing the classifier when classifier is a blob path"),
 ):
-    # Ensure Google creds are available
-    creds_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "smart-vision-trainiing-sa.json"))
-    set_google_credentials_from_file(creds_path)
-
     # Fallback to header variants if not provided via explicit Header params
     headers = request.headers
     customer_id = customer_id or headers.get("customer_id") or headers.get("customer-id")
@@ -230,8 +249,8 @@ async def infer(
         project_id=project_id,
     )
 
-    # Load model (cached)
-    model = load_model_cached(model_path)
+    # Load model (cached) in threadpool to avoid blocking event loop
+    model = await run_in_threadpool(load_model_cached, model_path)
 
     # Read file into PIL image (support both 'file' and 'image' fields)
     selected = file if file is not None else image
@@ -243,7 +262,8 @@ async def infer(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Could not read image: {exc}")
 
-    inference = run_yolo_inference(model, pil_image)
+    # Run inference in a thread and guard with per-model lock for safety
+    inference = await run_in_threadpool(_run_inference_threadsafe, model_path, model, pil_image)
 
     response: Dict[str, Any] = {
         "customer_id": customer_id,
