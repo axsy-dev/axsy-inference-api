@@ -30,15 +30,15 @@ curl -sS -X POST http://localhost:3000/infer \
 
 Headers
 -------
-- `classifier` (optional): absolute path or `gs://` path to YOLO model. If omitted, defaults to `./axsy-yolo.pt`.
-- `gcs_bucket` (optional): bucket name when `classifier` is a blob path (no scheme).
-- `customer_id`, `model_id` (optional): when both are provided and `classifier` is a blob path, the bucket is inferred as `customer_id`, and the blob as `model_id + '/' + classifier`.
+- `detector` (optional): absolute path or `gs://` path to YOLO model. If omitted, defaults to `./axsy-yolo.pt`.
+- `gcs_bucket` (optional): bucket name when `detector` is a blob path (no scheme).
+- `customer_id`, `model_id` (optional): when both are provided and `detector` is a blob path, the bucket is inferred as `customer_id`, and the blob as `model_id + '/' + detector`.
 
 Response
 --------
 ```json
 {
-  "classifier": "...",
+  "detector": "...",
   "result": {
     "image": {"width": 1928, "height": 2472},
     "speed_ms": {"preprocess": 2.7, "inference": 454.0, "postprocess": 8.4},

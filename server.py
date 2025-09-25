@@ -83,25 +83,25 @@ def _download_blob_to_cache(bucket_name: str, blob_path: str, project_id: Option
 
 
 def resolve_model_path(
-    classifier_value: str,
+    detector_value: str,
     gcs_bucket: Optional[str],
     customer_id: Optional[str] = None,
     model_id: Optional[str] = None,
     project_id: Optional[str] = None,
 ) -> str:
     # 1) Absolute local path
-    if os.path.isabs(classifier_value) and os.path.isfile(classifier_value):
-        return classifier_value
+    if os.path.isabs(detector_value) and os.path.isfile(detector_value):
+        return detector_value
 
     # 2) Relative local path (resolve to cwd)
-    rel_path = os.path.abspath(classifier_value)
+    rel_path = os.path.abspath(detector_value)
     if os.path.isfile(rel_path):
         return rel_path
 
     # 3) GCS path explicit
-    if classifier_value.startswith("gs://"):
+    if detector_value.startswith("gs://"):
         # gs://bucket/path/to/model.pt
-        without_scheme = classifier_value[len("gs://") :]
+        without_scheme = detector_value[len("gs://") :]
         parts = without_scheme.split("/", 1)
         if len(parts) != 2:
             raise HTTPException(status_code=400, detail="Invalid gs:// path provided")
@@ -111,19 +111,19 @@ def resolve_model_path(
     # 4) GCS path via provided bucket header or env var
     bucket_name = gcs_bucket or os.getenv("GCS_BUCKET")
     if bucket_name:
-        # Interpret classifier value as the blob path
-        return _download_blob_to_cache(bucket_name, classifier_value, None)
+        # Interpret detector value as the blob path
+        return _download_blob_to_cache(bucket_name, detector_value, None)
 
-    # 4b) Infer from customer_id/model_id headers: bucket = customer_id; blob = model_id + '/' + classifier
+    # 4b) Infer from customer_id/model_id headers: bucket = customer_id; blob = model_id + '/' + detector
     if customer_id and model_id:
-        inferred_blob = f"{model_id.rstrip('/')}/{classifier_value.lstrip('/')}"
+        inferred_blob = f"{model_id.rstrip('/')}/{detector_value.lstrip('/')}"
         return _download_blob_to_cache(customer_id, inferred_blob, None)
 
     # If we reach here, we couldn't resolve the model
     raise HTTPException(
         status_code=400,
         detail=(
-            "Classifier not found locally and no GCS bucket specified. "
+            "Detector not found locally and no GCS bucket specified. "
             "Provide an absolute local path, a gs:// URL, or include 'gcs_bucket' header or GCS_BUCKET env var."
         ),
     )
@@ -221,28 +221,28 @@ async def infer(
     customer_id: Optional[str] = Header(default=None),
     model_id: Optional[str] = Header(default=None),
     project_id: Optional[str] = Header(default=None),
-    classifier: Optional[str] = Header(default=None, description="Relative or absolute model path"),
-    gcs_bucket: Optional[str] = Header(default=None, description="GCS bucket containing the classifier when classifier is a blob path"),
+    detector: Optional[str] = Header(default=None, description="Relative or absolute model path"),
+    gcs_bucket: Optional[str] = Header(default=None, description="GCS bucket containing the detector when detector is a blob path"),
 ):
     # Fallback to header variants if not provided via explicit Header params
     headers = request.headers
     customer_id = customer_id or headers.get("customer_id") or headers.get("customer-id")
     model_id = model_id or headers.get("model_id") or headers.get("model-id")
     project_id = project_id or headers.get("project_id") or headers.get("project-id")
-    classifier = classifier or headers.get("classifier") or headers.get("model")
+    detector = detector or headers.get("detector") or headers.get("model")
     # Support both hyphen/underscore for gcs bucket header
     gcs_bucket = gcs_bucket or headers.get("gcs_bucket") or headers.get("gcs-bucket") or os.getenv("GCS_BUCKET")
 
-    if classifier is None:
+    if detector is None:
         # Default to local detection model in project root
         default_model = os.path.abspath(os.path.join(os.path.dirname(__file__), "axsy-yolo.pt"))
         if not os.path.isfile(default_model):
-            raise HTTPException(status_code=400, detail="Missing required header: classifier (and default axsy-yolo.pt not found)")
-        classifier = default_model
+            raise HTTPException(status_code=400, detail="Missing required header: detector (and default axsy-yolo.pt not found)")
+        detector = default_model
 
     # Resolve model path locally or via GCS
     model_path = resolve_model_path(
-        classifier,
+        detector,
         gcs_bucket,
         customer_id=customer_id,
         model_id=model_id,
@@ -269,7 +269,7 @@ async def infer(
         "customer_id": customer_id,
         "model_id": model_id,
         "project_id": project_id,
-        "classifier": classifier,
+        "detector": detector,
         "result": inference,
     }
 
@@ -312,8 +312,8 @@ async def upload_page():
             <label>Image</label>
             <input id=\"file\" name=\"file\" type=\"file\" accept=\"image/*\" required />
 
-            <label>Classifier (model path or gs:// or blob path)</label>
-            <input id=\"classifier\" type=\"text\" placeholder=\"e.g. axsy-yolo.pt or gs://bucket/model.pt\" />
+            <label>Detector (model path or gs:// or blob path)</label>
+            <input id=\"detector\" type=\"text\" placeholder=\"e.g. axsy-yolo.pt or gs://bucket/model.pt\" />
 
             <div class=\"row\">
               <div>
@@ -481,12 +481,12 @@ async def upload_page():
             formData.append('file', file);
 
             const headers = {};
-            const classifier = document.getElementById('classifier').value.trim();
+            const detector = document.getElementById('detector').value.trim();
             const gcs_bucket = document.getElementById('gcs_bucket').value.trim();
             const customer_id = document.getElementById('customer_id').value.trim();
             const model_id = document.getElementById('model_id').value.trim();
             const project_id = document.getElementById('project_id').value.trim();
-            if (classifier) headers['classifier'] = classifier;
+            if (detector) headers['detector'] = detector;
             if (gcs_bucket) headers['gcs_bucket'] = gcs_bucket;
             if (customer_id) headers['customer_id'] = customer_id;
             if (model_id) headers['model_id'] = model_id;
