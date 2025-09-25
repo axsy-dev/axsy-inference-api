@@ -349,12 +349,12 @@ async def upload_page():
         </div>
 
         <div class=\"panel\">
-          <div class=\"media\" id=\"media\" style=\"display:none\;\">
+          <div class=\"media\" id=\"media\" style=\"display:none;\">
             <img id=\"img\" alt=\"uploaded image\" />
             <canvas id=\"overlay\"></canvas>
           </div>
-          <div id=\"meta\" style=\"margin-top:12px\; display:none\;\"></div>
-          <div id=\"details\" class=\"details\" style=\"display:none\;\"></div>
+          <div id=\"meta\" style=\"margin-top:12px; display:none;\"></div>
+          <div id=\"details\" class=\"details\" style=\"display:none;\"></div>
         </div>
       </div>
 
