@@ -32,5 +32,6 @@ smart-vision-trainiing-sa.json
 # Local test assets
 *.jpg
 *.png
+axsy-classifier.json
 
 
