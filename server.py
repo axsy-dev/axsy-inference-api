@@ -5,7 +5,7 @@ import threading
 from functools import lru_cache
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, File, Header, HTTPException, UploadFile, Request
+from fastapi import FastAPI, File, Header, HTTPException, UploadFile, Request, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, HTMLResponse
 from PIL import Image
@@ -40,6 +40,40 @@ def load_model_cached(model_path: str) -> YOLO:
         return model
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to load model: {exc}")
+
+
+# --- Classifier support ---
+@lru_cache(maxsize=8)
+def load_classifier_cached(model_path: str):
+    try:
+        from classifier import load_classifier  # local import to avoid hard dep when unused
+        model = load_classifier(model_path)
+        return model
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to load classifier: {exc}")
+
+
+def load_classifier_labels() -> Optional[list[str]]:
+    """Load class labels from axsy-classifier.json in project root if present (no caching)."""
+    try:
+        labels_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "axsy-classifier.json"))
+        if not os.path.isfile(labels_path):
+            return None
+        with open(labels_path, "r") as f:
+            data = json.load(f)
+        if isinstance(data, list) and all(isinstance(x, str) for x in data):
+            return data
+        if isinstance(data, dict):
+            for key in ("labels", "classes", "names"):
+                val = data.get(key)
+                if isinstance(val, list) and all(isinstance(x, str) for x in val):
+                    return val
+            for val in data.values():
+                if isinstance(val, list) and all(isinstance(x, str) for x in val):
+                    return val
+        return None
+    except Exception:
+        return None
 
 
 def _ensure_storage_client(project_id: Optional[str] = None) -> "storage.Client":
@@ -129,6 +163,23 @@ def resolve_model_path(
     )
 
 
+def _prepare_image_tensor(pil_image: Image.Image, size: int, device: str):
+    # Lazy import heavy deps to avoid impacting default detection endpoint
+    import numpy as np  # type: ignore
+    import torch  # type: ignore
+
+    img = pil_image.resize((size, size))
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+    if arr.ndim == 2:
+        arr = np.stack([arr, arr, arr], axis=-1)
+    if arr.shape[2] == 4:
+        arr = arr[:, :, :3]
+    chw = np.transpose(arr, (2, 0, 1))
+    bchw = np.expand_dims(chw, axis=0)
+    x = torch.from_numpy(bchw).to(device)
+    return x
+
+
 def run_yolo_inference(model: YOLO, pil_image: Image.Image):
     results = model(pil_image)
     if not results:
@@ -213,6 +264,82 @@ def _run_inference_threadsafe(model_path: str, model: YOLO, pil_image: Image.Ima
         return run_yolo_inference(model, pil_image)
 
 
+def _run_classification_threadsafe(model_path: str, model, pil_image: Image.Image) -> Dict[str, Any]:
+    lock = _get_lock(_model_locks, model_path)
+    with lock:
+        # Derive input size from model attribute
+        try:
+            inp_size = int(model.sizes[0].item())
+        except Exception:
+            inp_size = 32
+        # Resolve device without importing torch globally
+        try:
+            device = next(model.parameters()).device.type
+        except Exception:
+            device = "cpu"
+        x = _prepare_image_tensor(pil_image, inp_size, device)
+        from classifier import classify_image_tensor  # local import to keep deps lazy
+        result = classify_image_tensor(model, x)
+        return {
+            "input_size": inp_size,
+            **result,
+        }
+
+
+def _clamp_box(x1, y1, x2, y2, w, h):
+    x1 = max(0.0, min(x1, w))
+    y1 = max(0.0, min(y1, h))
+    x2 = max(0.0, min(x2, w))
+    y2 = max(0.0, min(y2, h))
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    return x1, y1, x2, y2
+
+
+def _reclassify_products(
+    pil_image: Image.Image,
+    detections: list[Dict[str, Any]],
+    model_path: str,
+    classifier_model,
+    labels: Optional[list[str]],
+) -> None:
+    if not detections:
+        return
+    try:
+        w, h = pil_image.width, pil_image.height
+        # Determine classifier input size and device
+        try:
+            inp_size = int(classifier_model.sizes[0].item())
+        except Exception:
+            inp_size = 64
+        try:
+            device = next(classifier_model.parameters()).device.type
+        except Exception:
+            device = "cpu"
+
+        for det in detections:
+            if str(det.get("class_name")) != "product":
+                continue
+            x1, y1, x2, y2 = det.get("box", {}).get("xyxy", [0, 0, 0, 0])
+            x1, y1, x2, y2 = _clamp_box(float(x1), float(y1), float(x2), float(y2), float(w), float(h))
+            crop = pil_image.crop((x1, y1, x2, y2)).convert("RGB")
+            x = _prepare_image_tensor(crop, inp_size, device)
+            from classifier import classify_image_tensor  # lazy import
+            out = classify_image_tensor(classifier_model, x)
+            idx = int(out.get("top_index", -1))
+            det["classifier_id"] = idx
+            if labels and 0 <= idx < len(labels):
+                det["class_name"] = labels[idx]
+            elif labels:
+                det["class_name"] = labels[0]
+            det["confidence"] = float(out.get("top_prob", det.get("confidence", 0.0)))
+    except Exception:
+        # Fail-open: leave detections as-is
+        return
+
+
 @app.post("/infer")
 async def infer(
     request: Request,
@@ -223,6 +350,7 @@ async def infer(
     project_id: Optional[str] = Header(default=None),
     detector: Optional[str] = Header(default=None, description="Relative or absolute model path"),
     gcs_bucket: Optional[str] = Header(default=None, description="GCS bucket containing the detector when detector is a blob path"),
+    reclassify_products: Optional[bool] = Header(default=None, description="If true, reclassify 'product' detections with classifier"),
 ):
     # Fallback to header variants if not provided via explicit Header params
     headers = request.headers
@@ -265,12 +393,99 @@ async def infer(
     # Run inference in a thread and guard with per-model lock for safety
     inference = await run_in_threadpool(_run_inference_threadsafe, model_path, model, pil_image)
 
+    # Optional product reclassification
+    headers_flag = headers.get("reclassify_products") or headers.get("reclassify-products")
+    flag = reclassify_products
+    if flag is None and headers_flag is not None:
+        val = str(headers_flag).strip().lower()
+        flag = val in ("1", "true", "yes", "on")
+    flag = bool(flag)
+    if flag:
+        try:
+            # Load classifier and labels
+            default_classifier = os.path.abspath(os.path.join(os.path.dirname(__file__), "axsy-classifier.pt"))
+            classifier_path = default_classifier if os.path.isfile(default_classifier) else None
+            if classifier_path is None:
+                raise RuntimeError("Classifier weights not found.")
+            classifier_model = await run_in_threadpool(load_classifier_cached, classifier_path)
+            labels = load_classifier_labels()
+            await run_in_threadpool(_reclassify_products, pil_image, inference.get("detections", []), classifier_path, classifier_model, labels)
+        except Exception:
+            pass
+
     response: Dict[str, Any] = {
         "customer_id": customer_id,
         "model_id": model_id,
         "project_id": project_id,
         "detector": detector,
         "result": inference,
+    }
+
+    return JSONResponse(content=response)
+
+
+@app.post("/classify")
+async def classify(
+    request: Request,
+    file: Optional[UploadFile] = File(default=None, description="Image file to classify"),
+    image: Optional[UploadFile] = File(default=None, description="Alternative field name for the image"),
+    customer_id: Optional[str] = Header(default=None),
+    model_id: Optional[str] = Header(default=None),
+    project_id: Optional[str] = Header(default=None),
+    classifier: Optional[str] = Header(default=None, description="Relative or absolute classifier path"),
+    gcs_bucket: Optional[str] = Header(default=None, description="GCS bucket containing the classifier when path is a blob"),
+):
+    headers = request.headers
+    customer_id = customer_id or headers.get("customer_id") or headers.get("customer-id")
+    model_id = model_id or headers.get("model_id") or headers.get("model-id")
+    project_id = project_id or headers.get("project_id") or headers.get("project-id")
+    classifier = classifier or headers.get("classifier") or headers.get("model")
+    gcs_bucket = gcs_bucket or headers.get("gcs_bucket") or headers.get("gcs-bucket") or os.getenv("GCS_BUCKET")
+
+    if classifier is None:
+        default_model = os.path.abspath(os.path.join(os.path.dirname(__file__), "axsy-classifier.pt"))
+        if not os.path.isfile(default_model):
+            raise HTTPException(status_code=400, detail="Missing required header: classifier (and default axsy-classifier.pt not found)")
+        classifier = default_model
+
+    model_path = resolve_model_path(
+        classifier,
+        gcs_bucket,
+        customer_id=customer_id,
+        model_id=model_id,
+        project_id=project_id,
+    )
+
+    model = await run_in_threadpool(load_classifier_cached, model_path)
+
+    selected = file if file is not None else image
+    if selected is None:
+        raise HTTPException(status_code=400, detail="Missing image file. Use form field 'file' or 'image'.")
+    try:
+        contents = await selected.read()
+        pil_image = Image.open(io.BytesIO(contents)).convert("RGB")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not read image: {exc}")
+
+    inference = await run_in_threadpool(_run_classification_threadsafe, model_path, model, pil_image)
+    labels = load_classifier_labels()
+    top_label = None
+    if labels:
+        try:
+            idx = int(inference.get("top_index", -1))
+            if 0 <= idx < len(labels):
+                top_label = labels[idx]
+            else:
+                top_label = labels[0]
+        except Exception:
+            top_label = labels[0]
+
+    response: Dict[str, Any] = {
+        "customer_id": customer_id,
+        "model_id": model_id,
+        "project_id": project_id,
+        "classifier": classifier,
+        "result": {**inference, **({"top_label": top_label} if top_label is not None else {})},
     }
 
     return JSONResponse(content=response)
@@ -339,6 +554,7 @@ async def upload_page():
             <div style=\"display:flex; gap: 12px; align-items:center; margin-top:12px; flex-wrap: wrap;\">
               <button id=\"run\" type=\"submit\">Run inference</button>
               <label style=\"display:flex; gap:6px; align-items:center; margin:0;\"><input id=\"show_labels\" type=\"checkbox\" checked /> Show labels</label>
+              <label style=\"display:flex; gap:6px; align-items:center; margin:0;\"><input id=\"reclassify_products\" type=\"checkbox\" /> Reclassify products</label>
               <label style=\"display:flex; gap:8px; align-items:center; margin:0;\">
                 Overlay scale
                 <input id=\"overlay_scale\" type=\"range\" min=\"0.5\" max=\"1.5\" step=\"0.05\" value=\"0.8\" />
@@ -370,6 +586,7 @@ async def upload_page():
         const showLabels = document.getElementById('show_labels');
         const overlayScale = document.getElementById('overlay_scale');
         const overlayScaleValue = document.getElementById('overlay_scale_value');
+        const reclassifyProducts = document.getElementById('reclassify_products');
 
         function hashString(str) {
           let h = 0;
@@ -491,6 +708,7 @@ async def upload_page():
             if (customer_id) headers['customer_id'] = customer_id;
             if (model_id) headers['model_id'] = model_id;
             if (project_id) headers['project_id'] = project_id;
+            if (reclassifyProducts && reclassifyProducts.checked) headers['reclassify_products'] = 'true';
 
             const resp = await fetch('/infer', { method: 'POST', body: formData, headers });
             if (!resp.ok) {
