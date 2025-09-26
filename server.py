@@ -88,47 +88,72 @@ def load_labels_for_classifier(
     customer_id: Optional[str],
     model_id: Optional[str],
     project_id: Optional[str],
+    metadata_value: Optional[str] = None,
 ) -> Optional[list[str]]:
     """Resolve and load labels for a given classifier.
 
     Preference order:
-    1) If a classifier header was provided, try to resolve an adjacent .json using the same resolution rules
-       (local, gs://, gcs_bucket, inferred bucket), and load it if present.
-    2) Try a local .json next to the resolved model_path.
-    3) Fallback to project-root axsy-classifier.json.
+    1) If a metadata header was provided, resolve it (local or remote) and load labels from it.
+    2) If a classifier header was provided, try adjacent metadata JSON candidates using the same resolution rules:
+       '<base>.metadata.json', '<base>.meta.json', '<base>.json'.
+    3) Try local candidates next to the resolved model_path.
+    4) Fallback to project-root axsy-classifier.json.
     """
-    # 1) Resolve via the original classifier value if provided
+    # 1) Explicit metadata header
     try:
-        if classifier_value:
-            json_value = os.path.splitext(classifier_value)[0] + ".json"
+        if metadata_value:
             try:
-                resolved = resolve_model_path(
-                    json_value,
+                resolved_meta = resolve_model_path(
+                    metadata_value,
                     gcs_bucket,
                     customer_id=customer_id,
                     model_id=model_id,
                     project_id=project_id,
                 )
-                labels = _load_labels_from_json(resolved)
+                labels = _load_labels_from_json(resolved_meta)
                 if labels:
                     return labels
             except Exception:
-                # Best-effort: ignore and continue to next strategy
                 pass
     except Exception:
         pass
 
-    # 2) Attempt local file adjacent to resolved model_path
+    # 2) Resolve via the original classifier value if provided
     try:
-        if model_path:
-            local_candidate = os.path.splitext(model_path)[0] + ".json"
-            labels = _load_labels_from_json(local_candidate)
-            if labels:
-                return labels
+        if classifier_value:
+            base = os.path.splitext(classifier_value)[0]
+            for suffix in (".metadata.json", ".meta.json", ".json"):
+                candidate = base + suffix
+                try:
+                    resolved = resolve_model_path(
+                        candidate,
+                        gcs_bucket,
+                        customer_id=customer_id,
+                        model_id=model_id,
+                        project_id=project_id,
+                    )
+                    labels = _load_labels_from_json(resolved)
+                    if labels:
+                        return labels
+                except Exception:
+                    # Best-effort: ignore and try next candidate
+                    pass
     except Exception:
         pass
 
-    # 3) Fallback
+    # 3) Attempt local file adjacent to resolved model_path
+    try:
+        if model_path:
+            base = os.path.splitext(model_path)[0]
+            for suffix in (".metadata.json", ".meta.json", ".json"):
+                local_candidate = base + suffix
+                labels = _load_labels_from_json(local_candidate)
+                if labels:
+                    return labels
+    except Exception:
+        pass
+
+    # 4) Fallback
     return load_classifier_labels()
 
 
@@ -516,12 +541,14 @@ async def classify(
     project_id: Optional[str] = Header(default=None),
     classifier: Optional[str] = Header(default=None, description="Relative or absolute classifier path"),
     gcs_bucket: Optional[str] = Header(default=None, description="GCS bucket containing the classifier when path is a blob"),
+    metadata: Optional[str] = Header(default=None, description="Optional path to metadata JSON containing labels"),
 ):
     headers = request.headers
     customer_id = customer_id or headers.get("customer_id") or headers.get("customer-id")
     model_id = model_id or headers.get("model_id") or headers.get("model-id")
     project_id = project_id or headers.get("project_id") or headers.get("project-id")
     classifier = classifier or headers.get("classifier") or headers.get("model")
+    metadata = metadata or headers.get("metadata") or headers.get("meta")
     gcs_bucket = gcs_bucket or headers.get("gcs_bucket") or headers.get("gcs-bucket") or os.getenv("GCS_BUCKET")
 
     if classifier is None:
@@ -557,6 +584,7 @@ async def classify(
         customer_id,
         model_id,
         project_id,
+        metadata_value=metadata,
     )
     top_label = None
     if labels:
