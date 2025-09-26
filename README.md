@@ -1,7 +1,7 @@
 Axsy Inference API
 ===================
 
-FastAPI service exposing YOLO detection on images. Defaults to local `axsy-yolo.pt` and returns structured detections with image metadata and speed.
+FastAPI service exposing YOLO detection and CNN classification on images. Detection defaults to local `axsy-yolo.pt`; classification defaults to local `axsy-classifier.pt`.
 
 Run locally
 -----------
@@ -27,12 +27,38 @@ uvicorn server:get_app --factory --host 0.0.0.0 --port 3000
 curl -sS -X POST http://localhost:3000/infer \
   -F "image=@/path/to/image.jpg"
 ```
+4) Test classification (defaults to `axsy-classifier.pt`):
+
+```bash
+curl -sS -X POST http://localhost:3000/classify \
+  -F "image=@/path/to/image.jpg"
+```
+
 
 Headers
 -------
 - `detector` (optional): absolute path or `gs://` path to YOLO model. If omitted, defaults to `./axsy-yolo.pt`.
 - `gcs_bucket` (optional): bucket name when `detector` is a blob path (no scheme).
 - `customer_id`, `model_id` (optional): when both are provided and `detector` is a blob path, the bucket is inferred as `customer_id`, and the blob as `model_id + '/' + detector`.
+
+Classification headers
+----------------------
+- `classifier` (optional): absolute path or `gs://` path to classifier weights. If omitted, defaults to `./axsy-classifier.pt`.
+- `gcs_bucket`, `customer_id`, `model_id` behave the same as detection for resolving remote paths.
+
+Classification response
+-----------------------
+```json
+{
+  "classifier": "...",
+  "result": {
+    "input_size": 32,
+    "top_index": 12,
+    "top_prob": 0.93,
+    "probs": [0.01, 0.00, ...]
+  }
+}
+```
 
 Response
 --------
