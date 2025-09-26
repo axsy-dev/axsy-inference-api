@@ -53,10 +53,9 @@ def load_classifier_cached(model_path: str):
         raise HTTPException(status_code=400, detail=f"Failed to load classifier: {exc}")
 
 
-def load_classifier_labels() -> Optional[list[str]]:
-    """Load class labels from axsy-classifier.json in project root if present (no caching)."""
+def _load_labels_from_json(labels_path: str) -> Optional[list[str]]:
+    """Load class labels from a JSON file if present. Returns None on any error."""
     try:
-        labels_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "axsy-classifier.json"))
         if not os.path.isfile(labels_path):
             return None
         with open(labels_path, "r") as f:
@@ -74,6 +73,63 @@ def load_classifier_labels() -> Optional[list[str]]:
         return None
     except Exception:
         return None
+
+
+def load_classifier_labels() -> Optional[list[str]]:
+    """Load class labels from axsy-classifier.json in project root if present (no caching)."""
+    labels_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "axsy-classifier.json"))
+    return _load_labels_from_json(labels_path)
+
+
+def load_labels_for_classifier(
+    classifier_value: Optional[str],
+    model_path: Optional[str],
+    gcs_bucket: Optional[str],
+    customer_id: Optional[str],
+    model_id: Optional[str],
+    project_id: Optional[str],
+) -> Optional[list[str]]:
+    """Resolve and load labels for a given classifier.
+
+    Preference order:
+    1) If a classifier header was provided, try to resolve an adjacent .json using the same resolution rules
+       (local, gs://, gcs_bucket, inferred bucket), and load it if present.
+    2) Try a local .json next to the resolved model_path.
+    3) Fallback to project-root axsy-classifier.json.
+    """
+    # 1) Resolve via the original classifier value if provided
+    try:
+        if classifier_value:
+            json_value = os.path.splitext(classifier_value)[0] + ".json"
+            try:
+                resolved = resolve_model_path(
+                    json_value,
+                    gcs_bucket,
+                    customer_id=customer_id,
+                    model_id=model_id,
+                    project_id=project_id,
+                )
+                labels = _load_labels_from_json(resolved)
+                if labels:
+                    return labels
+            except Exception:
+                # Best-effort: ignore and continue to next strategy
+                pass
+    except Exception:
+        pass
+
+    # 2) Attempt local file adjacent to resolved model_path
+    try:
+        if model_path:
+            local_candidate = os.path.splitext(model_path)[0] + ".json"
+            labels = _load_labels_from_json(local_candidate)
+            if labels:
+                return labels
+    except Exception:
+        pass
+
+    # 3) Fallback
+    return load_classifier_labels()
 
 
 def _ensure_storage_client(project_id: Optional[str] = None) -> "storage.Client":
@@ -494,7 +550,14 @@ async def classify(
         raise HTTPException(status_code=400, detail=f"Could not read image: {exc}")
 
     inference = await run_in_threadpool(_run_classification_threadsafe, model_path, model, pil_image)
-    labels = load_classifier_labels()
+    labels = load_labels_for_classifier(
+        classifier,
+        model_path,
+        gcs_bucket,
+        customer_id,
+        model_id,
+        project_id,
+    )
     top_label = None
     if labels:
         try:
