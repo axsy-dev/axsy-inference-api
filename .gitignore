@@ -30,7 +30,7 @@ smart-vision-trainiing-sa.json
 *.tflite
 
 # Local test assets
-test.jpg
-test2.png
+*.jpg
+*.png
 
 
