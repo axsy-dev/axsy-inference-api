@@ -277,11 +277,18 @@ def _run_classification_threadsafe(model_path: str, model, pil_image: Image.Imag
             device = next(model.parameters()).device.type
         except Exception:
             device = "cpu"
+        from time import perf_counter
+        t0 = perf_counter()
         x = _prepare_image_tensor(pil_image, inp_size, device)
+        t1 = perf_counter()
         from classifier import classify_image_tensor  # local import to keep deps lazy
         result = classify_image_tensor(model, x)
+        t2 = perf_counter()
+        preprocess_ms = float((t1 - t0) * 1000.0)
+        inference_ms = float((t2 - t1) * 1000.0)
         return {
             "input_size": inp_size,
+            "speed_ms": {"preprocess": preprocess_ms, "inference": inference_ms, "postprocess": None},
             **result,
         }
 
@@ -304,9 +311,9 @@ def _reclassify_products(
     model_path: str,
     classifier_model,
     labels: Optional[list[str]],
-) -> None:
+) -> Dict[str, Any]:
     if not detections:
-        return
+        return {"num": 0, "speed_ms": {"preprocess": 0.0, "inference": 0.0, "postprocess": 0.0}}
     try:
         w, h = pil_image.width, pil_image.height
         # Determine classifier input size and device
@@ -319,25 +326,42 @@ def _reclassify_products(
         except Exception:
             device = "cpu"
 
+        from time import perf_counter
+        total_pre_ms = 0.0
+        total_inf_ms = 0.0
+        total_post_ms = 0.0
+        count = 0
         for det in detections:
             if str(det.get("class_name")) != "product":
                 continue
             x1, y1, x2, y2 = det.get("box", {}).get("xyxy", [0, 0, 0, 0])
             x1, y1, x2, y2 = _clamp_box(float(x1), float(y1), float(x2), float(y2), float(w), float(h))
             crop = pil_image.crop((x1, y1, x2, y2)).convert("RGB")
+            t0 = perf_counter()
             x = _prepare_image_tensor(crop, inp_size, device)
+            t1 = perf_counter()
             from classifier import classify_image_tensor  # lazy import
             out = classify_image_tensor(classifier_model, x)
+            t2 = perf_counter()
             idx = int(out.get("top_index", -1))
+            t3 = perf_counter()
             det["classifier_id"] = idx
             if labels and 0 <= idx < len(labels):
                 det["class_name"] = labels[idx]
             elif labels:
                 det["class_name"] = labels[0]
             det["confidence"] = float(out.get("top_prob", det.get("confidence", 0.0)))
+            total_pre_ms += float((t1 - t0) * 1000.0)
+            total_inf_ms += float((t2 - t1) * 1000.0)
+            total_post_ms += float((t3 - t2) * 1000.0)
+            count += 1
     except Exception:
         # Fail-open: leave detections as-is
-        return
+        return {"num": 0, "speed_ms": {"preprocess": None, "inference": None, "postprocess": None}}
+    return {
+        "num": count,
+        "speed_ms": {"preprocess": total_pre_ms, "inference": total_inf_ms, "postprocess": total_post_ms},
+    }
 
 
 @app.post("/infer")
@@ -409,7 +433,9 @@ async def infer(
                 raise RuntimeError("Classifier weights not found.")
             classifier_model = await run_in_threadpool(load_classifier_cached, classifier_path)
             labels = load_classifier_labels()
-            await run_in_threadpool(_reclassify_products, pil_image, inference.get("detections", []), classifier_path, classifier_model, labels)
+            re_stats = await run_in_threadpool(_reclassify_products, pil_image, inference.get("detections", []), classifier_path, classifier_model, labels)
+            if isinstance(re_stats, dict):
+                inference["reclassify"] = re_stats
         except Exception:
             pass
 
@@ -669,13 +695,17 @@ async def upload_page():
 
         function renderMeta(response) {
           const r = response.result;
-          const speed = r.speed_ms || {}; 
+          const speed = r.speed_ms || {};
+          const rc = r.reclassify || null;
+          const rcSpeed = rc && rc.speed_ms ? rc.speed_ms : null;
           const pills = Object.entries(r.class_counts || {}).map(([k,v]) => `<span class=\"pill\">${k}: ${v}</span>`).join(' ');
           meta.innerHTML = `
             <div class=\"kv\">
               <div>Detections</div><div><strong>${r.num_detections}</strong></div>
               <div>Image</div><div>${r.image.width} × ${r.image.height}</div>
               <div>Speed (ms)</div><div>pre: ${fmt(speed.preprocess)} · infer: ${fmt(speed.inference)} · post: ${fmt(speed.postprocess)}</div>
+              ${rc ? `<div>Reclassify</div><div>${rc.num} items</div>` : ''}
+              ${rcSpeed ? `<div>Reclassify speed (ms)</div><div>pre: ${fmt(rcSpeed.preprocess)} · infer: ${fmt(rcSpeed.inference)} · post: ${fmt(rcSpeed.postprocess)}</div>` : ''}
               <div>Classes</div><div>${pills || '—'}</div>
             </div>
           `;

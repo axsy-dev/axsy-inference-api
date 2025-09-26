@@ -1,4 +1,5 @@
 import os
+import json
 from typing import Optional, Tuple, Dict, Any
 
 import torch
@@ -73,7 +74,8 @@ class Classifier(nn.Module):
             ]
         )
 
-        self.softmax = nn.Softmax()
+        # Explicit dim to avoid deprecation warning and ensure class-probability over classes
+        self.softmax = nn.Softmax(dim=1)
 
     def forward(
         self,
@@ -107,6 +109,50 @@ class Classifier(nn.Module):
     __call__ = forward
 
 
+def _read_classifier_config() -> Optional[Dict[str, Any]]:
+    """Read axsy-classifier.json if present and return dict, else None."""
+    try:
+        config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "axsy-classifier.json"))
+        if not os.path.isfile(config_path):
+            return None
+        with open(config_path, "r") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+        return None
+    except Exception:
+        return None
+
+
+def _extract_inp_size_from_config(cfg: Dict[str, Any]) -> Optional[int]:
+    """Extract integer input size from config dict.
+
+    Supports keys 'imp_size' (note the 'm'), 'inp_size' at the top level,
+    or inside 'additional_metadata'. Values may be strings or integers.
+    """
+    def _to_int(v: Any) -> Optional[int]:
+        try:
+            iv = int(str(v).strip())
+            return iv if iv > 0 else None
+        except Exception:
+            return None
+
+    for key in ("imp_size", "inp_size"):
+        if key in cfg:
+            val = _to_int(cfg.get(key))
+            if val is not None:
+                return val
+
+    meta = cfg.get("additional_metadata")
+    if isinstance(meta, dict):
+        for key in ("imp_size", "inp_size"):
+            if key in meta:
+                val = _to_int(meta.get(key))
+                if val is not None:
+                    return val
+    return None
+
+
 def _normalise_batch(patches: Tensor) -> Tensor:
     # Compute per-channel mean/std over batch and spatial dims
     mean = patches.mean(dim=(0, 2, 3), keepdim=True)
@@ -124,6 +170,14 @@ def load_classifier(
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(weights_path, map_location=device)
     state_dict = ckpt.get("state_dict", ckpt)
+
+    # Prefer explicit configuration from JSON when available and caller didn't specify
+    if inp_size is None:
+        cfg = _read_classifier_config()
+        if cfg is not None:
+            cfg_inp = _extract_inp_size_from_config(cfg)
+            if cfg_inp is not None:
+                inp_size = cfg_inp
 
     # Infer architecture parameters when possible from checkpoint shapes
     inferred_classes = None
