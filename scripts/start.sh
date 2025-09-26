@@ -2,31 +2,31 @@
 set -euo pipefail
 
 ROOT_DIR="/home/ec2-user/axsy_inference"
-PID_FILE="$ROOT_DIR/uvicorn.pid"
-LOG_FILE="$ROOT_DIR/uvicorn.log"
+APP_NAME="axsy-inference"
+ECOSYSTEM_FILE="$ROOT_DIR/ecosystem.config.js"
 SA_FILE="$ROOT_DIR/smart-vision-trainiing-sa.json"
 
 cd "$ROOT_DIR"
-
-if [[ -f "$PID_FILE" ]] && ps -p "$(cat "$PID_FILE" 2>/dev/null)" > /dev/null 2>&1; then
-  echo "Uvicorn already running with PID $(cat "$PID_FILE")."
-  exit 0
-fi
 
 if [[ -f "$SA_FILE" ]]; then
   export GOOGLE_APPLICATION_CREDENTIALS="$SA_FILE"
 fi
 
-nohup uvicorn server:get_app \
-  --factory \
-  --host 0.0.0.0 \
-  --port 3000 \
-  --workers 1 \
-  --log-level info \
-  >> "$LOG_FILE" 2>&1 &
+if ! command -v pm2 >/dev/null 2>&1; then
+  echo "pm2 not found. Install with: npm i -g pm2"
+  exit 1
+fi
 
-echo $! > "$PID_FILE"
-echo "Started Uvicorn (PID $(cat "$PID_FILE")) on 0.0.0.0:3000"
+if pm2 describe "$APP_NAME" >/dev/null 2>&1; then
+  echo "Reloading PM2 app '$APP_NAME'..."
+  pm2 reload "$ECOSYSTEM_FILE" --only "$APP_NAME" --update-env | cat
+else
+  echo "Starting PM2 app '$APP_NAME'..."
+  pm2 start "$ECOSYSTEM_FILE" --only "$APP_NAME" --update-env | cat
+fi
+
+pm2 save | cat
+echo "PM2 managed app '$APP_NAME' is running."
 
 
 

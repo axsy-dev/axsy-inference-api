@@ -91,3 +91,39 @@ Operational notes
 - The API is multi-user safe: model downloads are serialized per file, models are cached, and inference runs under a per‑model lock in a threadpool.
 - Keep `smart-vision-trainiing-sa.json` and large model weights out of git.
 
+Production (PM2)
+----------------
+Use PM2 to manage the API in production.
+
+1) Install PM2 globally (once):
+
+```bash
+npm i -g pm2
+```
+
+2) Start the service:
+
+```bash
+/home/ec2-user/axsy_inference/scripts/start.sh
+```
+
+3) Check status and logs:
+
+```bash
+pm2 status axsy-inference
+pm2 logs axsy-inference
+```
+
+4) Stop the service:
+
+```bash
+/home/ec2-user/axsy_inference/scripts/stop.sh
+```
+
+5) Persist across reboots (once):
+
+```bash
+pm2 save
+pm2 startup  # follow the printed instructions
+```
+

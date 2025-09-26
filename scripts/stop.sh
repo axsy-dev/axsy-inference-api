@@ -1,21 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="/home/ec2-user/axsy_inference"
-PID_FILE="$ROOT_DIR/uvicorn.pid"
+APP_NAME="axsy-inference"
 
-if [[ -f "$PID_FILE" ]]; then
-  PID=$(cat "$PID_FILE" || true)
-  if [[ -n "${PID:-}" ]] && ps -p "$PID" > /dev/null 2>&1; then
-    kill "$PID" || true
-    sleep 1
+if command -v pm2 >/dev/null 2>&1; then
+  if pm2 describe "$APP_NAME" >/dev/null 2>&1; then
+    pm2 stop "$APP_NAME" || true
+    pm2 delete "$APP_NAME" || true
+    echo "Stopped and deleted PM2 app '$APP_NAME'."
+  else
+    echo "PM2 app '$APP_NAME' not found."
   fi
-  rm -f "$PID_FILE"
-  echo "Stopped Uvicorn."
 else
-  # Fallback: kill by pattern if no pid file
   pkill -f "uvicorn server:get_app" || true
-  echo "No PID file. Killed matching uvicorn processes if any."
+  echo "pm2 not installed. Killed matching uvicorn processes if any."
 fi
 
 
