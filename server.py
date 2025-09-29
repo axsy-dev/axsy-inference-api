@@ -456,6 +456,8 @@ async def infer(
     detector: Optional[str] = Header(default=None, description="Relative or absolute model path"),
     gcs_bucket: Optional[str] = Header(default=None, description="GCS bucket containing the detector when detector is a blob path"),
     reclassify_products: Optional[bool] = Header(default=None, description="If true, reclassify 'product' detections with classifier"),
+    classifier: Optional[str] = Header(default=None, description="Relative or absolute classifier path for reclassification"),
+    metadata: Optional[str] = Header(default=None, description="Optional path to metadata JSON containing labels for classifier reclassification"),
 ):
     # Fallback to header variants if not provided via explicit Header params
     headers = request.headers
@@ -465,6 +467,9 @@ async def infer(
     detector = detector or headers.get("detector") or headers.get("model")
     # Support both hyphen/underscore for gcs bucket header
     gcs_bucket = gcs_bucket or headers.get("gcs_bucket") or headers.get("gcs-bucket") or os.getenv("GCS_BUCKET")
+    # Optional classifier/metadata headers for reclassification
+    classifier = classifier or headers.get("classifier") or headers.get("model")
+    metadata = metadata or headers.get("metadata") or headers.get("meta")
 
     if detector is None:
         # Default to local detection model in project root
@@ -507,14 +512,39 @@ async def infer(
     flag = bool(flag)
     if flag:
         try:
-            # Load classifier and labels
-            default_classifier = os.path.abspath(os.path.join(os.path.dirname(__file__), "axsy-classifier.pt"))
-            classifier_path = default_classifier if os.path.isfile(default_classifier) else None
-            if classifier_path is None:
-                raise RuntimeError("Classifier weights not found.")
+            # Resolve classifier path from header if provided; fallback to default local file
+            clf_value = classifier
+            clf_default = os.path.abspath(os.path.join(os.path.dirname(__file__), "axsy-classifier.pt"))
+            if not clf_value:
+                if not os.path.isfile(clf_default):
+                    raise RuntimeError("Classifier weights not found.")
+                classifier_path = clf_default
+            else:
+                classifier_path = resolve_model_path(
+                    clf_value,
+                    gcs_bucket,
+                    customer_id=customer_id,
+                    model_id=model_id,
+                    project_id=project_id,
+                )
             classifier_model = await run_in_threadpool(load_classifier_cached, classifier_path)
-            labels = load_classifier_labels()
-            re_stats = await run_in_threadpool(_reclassify_products, pil_image, inference.get("detections", []), classifier_path, classifier_model, labels)
+            labels = load_labels_for_classifier(
+                clf_value if clf_value else classifier_path,
+                classifier_path,
+                gcs_bucket,
+                customer_id,
+                model_id,
+                project_id,
+                metadata_value=metadata,
+            )
+            re_stats = await run_in_threadpool(
+                _reclassify_products,
+                pil_image,
+                inference.get("detections", []),
+                classifier_path,
+                classifier_model,
+                labels,
+            )
             if isinstance(re_stats, dict):
                 inference["reclassify"] = re_stats
         except Exception:
@@ -646,6 +676,12 @@ async def upload_page():
 
             <label>Detector (model path or gs:// or blob path)</label>
             <input id=\"detector\" type=\"text\" placeholder=\"e.g. axsy-yolo.pt or gs://bucket/model.pt\" />
+
+            <label>Classifier (weights path or gs:// or blob path)</label>
+            <input id=\"classifier\" type=\"text\" placeholder=\"e.g. axsy-classifier.pt or gs://bucket/cls.pt\" />
+
+            <label>Classifier metadata JSON (optional labels)</label>
+            <input id=\"metadata\" type=\"text\" placeholder=\"e.g. axsy-classifier.json or gs://.../labels.json\" />
 
             <div class=\"row\">
               <div>
@@ -820,11 +856,15 @@ async def upload_page():
 
             const headers = {};
             const detector = document.getElementById('detector').value.trim();
+            const classifier = document.getElementById('classifier').value.trim();
+            const metadata = document.getElementById('metadata').value.trim();
             const gcs_bucket = document.getElementById('gcs_bucket').value.trim();
             const customer_id = document.getElementById('customer_id').value.trim();
             const model_id = document.getElementById('model_id').value.trim();
             const project_id = document.getElementById('project_id').value.trim();
             if (detector) headers['detector'] = detector;
+            if (classifier) headers['classifier'] = classifier;
+            if (metadata) headers['metadata'] = metadata;
             if (gcs_bucket) headers['gcs_bucket'] = gcs_bucket;
             if (customer_id) headers['customer_id'] = customer_id;
             if (model_id) headers['model_id'] = model_id;
