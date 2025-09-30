@@ -13,8 +13,9 @@ set -euo pipefail
 #   MEMORY (default: 1Gi)
 #   CONCURRENCY (default: 80)
 #   ALLOW_UNAUTH (default: true)
+#   REQUIRE_MODELS (default: true) - require axsy-yolo.pt and axsy-classifier.pt to exist
 
-PROJECT_ID=${1:-smart-vision-training}
+PROJECT_ID=${1:-smart_vision_training}
 REGION=${2:-europe-west1}
 SERVICE=${3:-axsy-inference}
 
@@ -34,6 +35,23 @@ CPU=${CPU:-1}
 MEMORY=${MEMORY:-1Gi}
 CONCURRENCY=${CONCURRENCY:-80}
 ALLOW_UNAUTH=${ALLOW_UNAUTH:-true}
+REQUIRE_MODELS=${REQUIRE_MODELS:-true}
+
+# Preflight: ensure default model files exist so the container has them at /app
+if [[ "${REQUIRE_MODELS}" == "true" ]]; then
+  missing=0
+  for f in axsy-yolo.pt axsy-classifier.pt; do
+    if [[ ! -f "$f" ]]; then
+      echo "ERROR: Missing required model file '$f' in project root $(pwd)." >&2
+      missing=1
+    fi
+  done
+  if [[ "$missing" -ne 0 ]]; then
+    echo "Place both axsy-yolo.pt and axsy-classifier.pt in the project root, then re-run." >&2
+    exit 1
+  fi
+  echo "Found default models:"; ls -lh axsy-yolo.pt axsy-classifier.pt
+fi
 
 # Ensure repo exists
 if ! gcloud artifacts repositories describe "$REPO" --location="$REGION" --project="$PROJECT_ID" >/dev/null 2>&1; then
