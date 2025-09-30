@@ -5,6 +5,7 @@ from typing import Optional, Tuple, Dict, Any
 import torch
 import torch.nn as nn
 from torch import Tensor
+import torch.backends.cudnn as cudnn
 
 
 class Classifier(nn.Module):
@@ -217,7 +218,14 @@ def classify_image_tensor(
     image_tensor_bchw: torch.Tensor,
 ) -> Dict[str, Any]:
     x = _normalise_batch(image_tensor_bchw)
-    probs, _ = model(x)
+    device_type = next(model.parameters()).device.type
+    if device_type == "cuda":
+        cudnn.benchmark = True
+        from torch.cuda.amp import autocast
+        with autocast():
+            probs, _ = model(x)
+    else:
+        probs, _ = model(x)
     probs_np = probs.detach().cpu().float().numpy()
     top_idx = int(probs[0].argmax().item())
     top_prob = float(probs[0, top_idx].item())
@@ -225,6 +233,45 @@ def classify_image_tensor(
         "top_index": top_idx,
         "top_prob": top_prob,
         "probs": probs_np[0].tolist(),
+    }
+
+
+
+@torch.inference_mode()
+def classify_image_batch(
+    model: Classifier,
+    images_bchw: torch.Tensor,
+) -> Dict[str, Any]:
+    """Classify a batch of images.
+
+    Parameters
+    ----------
+    model: Classifier
+        Loaded classifier model in eval mode.
+    images_bchw: torch.Tensor
+        Float tensor shaped (batch, channels, height, width) in [0, 1] range.
+
+    Returns
+    -------
+    Dict[str, Any]
+        Dictionary containing lists of top indices, top probabilities, and full
+        probability distributions per image.
+    """
+    x = _normalise_batch(images_bchw)
+    device_type = next(model.parameters()).device.type
+    if device_type == "cuda":
+        cudnn.benchmark = True
+        from torch.cuda.amp import autocast
+        with autocast():
+            probs, _ = model(x)
+    else:
+        probs, _ = model(x)
+    probs_np = probs.detach().cpu().float().numpy()
+    top_vals, top_idxs = probs.max(dim=1)
+    return {
+        "top_indices": [int(i) for i in top_idxs.detach().cpu().tolist()],
+        "top_probs": [float(v) for v in top_vals.detach().cpu().tolist()],
+        "probs": probs_np.tolist(),
     }
 
 

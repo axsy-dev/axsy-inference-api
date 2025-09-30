@@ -3,7 +3,7 @@ import json
 import os
 import threading
 from functools import lru_cache
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile, Request, Query
 from fastapi.concurrency import run_in_threadpool
@@ -257,9 +257,30 @@ def _prepare_image_tensor(pil_image: Image.Image, size: int, device: str):
         arr = arr[:, :, :3]
     chw = np.transpose(arr, (2, 0, 1))
     bchw = np.expand_dims(chw, axis=0)
-    x = torch.from_numpy(bchw).to(device)
+    non_blocking = (device == "cuda")
+    x = torch.from_numpy(bchw).to(device, non_blocking=non_blocking)
     return x
 
+
+def _prepare_image_tensor_batch(pil_images: list[Image.Image], size: int, device: str):
+    # Lazy import heavy deps only when needed
+    import numpy as np  # type: ignore
+    import torch  # type: ignore
+
+    arrays = []
+    for img in pil_images:
+        im = img.resize((size, size))
+        arr = np.asarray(im, dtype=np.float32) / 255.0
+        if arr.ndim == 2:
+            arr = np.stack([arr, arr, arr], axis=-1)
+        if arr.shape[2] == 4:
+            arr = arr[:, :, :3]
+        chw = np.transpose(arr, (2, 0, 1))
+        arrays.append(chw)
+    bchw = np.stack(arrays, axis=0)
+    non_blocking = (device == "cuda")
+    x = torch.from_numpy(bchw).to(device, non_blocking=non_blocking)
+    return x
 
 def run_yolo_inference(model: YOLO, pil_image: Image.Image):
     results = model(pil_image)
@@ -411,31 +432,47 @@ def _reclassify_products(
         total_pre_ms = 0.0
         total_inf_ms = 0.0
         total_post_ms = 0.0
-        count = 0
-        for det in detections:
+        # Collect product detections and crops
+        prod_indices: List[int] = []
+        crops: List[Image.Image] = []
+        for i, det in enumerate(detections):
             if str(det.get("class_name")) != "product":
                 continue
             x1, y1, x2, y2 = det.get("box", {}).get("xyxy", [0, 0, 0, 0])
             x1, y1, x2, y2 = _clamp_box(float(x1), float(y1), float(x2), float(y2), float(w), float(h))
             crop = pil_image.crop((x1, y1, x2, y2)).convert("RGB")
-            t0 = perf_counter()
-            x = _prepare_image_tensor(crop, inp_size, device)
-            t1 = perf_counter()
-            from classifier import classify_image_tensor  # lazy import
-            out = classify_image_tensor(classifier_model, x)
-            t2 = perf_counter()
-            idx = int(out.get("top_index", -1))
-            t3 = perf_counter()
-            det["classifier_id"] = idx
-            if labels and 0 <= idx < len(labels):
-                det["class_name"] = labels[idx]
+            crops.append(crop)
+            prod_indices.append(i)
+
+        if not crops:
+            return {"num": 0, "speed_ms": {"preprocess": 0.0, "inference": 0.0, "postprocess": 0.0}}
+
+        t0 = perf_counter()
+        batch_x = _prepare_image_tensor_batch(crops, inp_size, device)
+        t1 = perf_counter()
+        from classifier import classify_image_batch  # lazy import
+        out = classify_image_batch(classifier_model, batch_x)
+        t2 = perf_counter()
+
+        top_indices: List[int] = [int(v) for v in out.get("top_indices", [])]
+        top_probs: List[float] = [float(v) for v in out.get("top_probs", [])]
+
+        for offset, det_idx in enumerate(prod_indices):
+            idx_val = int(top_indices[offset]) if offset < len(top_indices) else -1
+            prob_val = float(top_probs[offset]) if offset < len(top_probs) else 0.0
+            det = detections[det_idx]
+            det["classifier_id"] = idx_val
+            if labels and 0 <= idx_val < len(labels):
+                det["class_name"] = labels[idx_val]
             elif labels:
                 det["class_name"] = labels[0]
-            det["confidence"] = float(out.get("top_prob", det.get("confidence", 0.0)))
-            total_pre_ms += float((t1 - t0) * 1000.0)
-            total_inf_ms += float((t2 - t1) * 1000.0)
-            total_post_ms += float((t3 - t2) * 1000.0)
-            count += 1
+            det["confidence"] = float(prob_val if prob_val else det.get("confidence", 0.0))
+
+        t3 = perf_counter()
+        total_pre_ms = float((t1 - t0) * 1000.0)
+        total_inf_ms = float((t2 - t1) * 1000.0)
+        total_post_ms = float((t3 - t2) * 1000.0)
+        count = len(prod_indices)
     except Exception:
         # Fail-open: leave detections as-is
         return {"num": 0, "speed_ms": {"preprocess": None, "inference": None, "postprocess": None}}
@@ -607,6 +644,8 @@ async def classify(
         raise HTTPException(status_code=400, detail=f"Could not read image: {exc}")
 
     inference = await run_in_threadpool(_run_classification_threadsafe, model_path, model, pil_image)
+    from time import perf_counter
+    t_post0 = perf_counter()
     labels = load_labels_for_classifier(
         classifier,
         model_path,
@@ -627,6 +666,14 @@ async def classify(
         except Exception:
             top_label = labels[0]
 
+    t_post1 = perf_counter()
+    try:
+        sp = inference.get("speed_ms") if isinstance(inference, dict) else None
+        if isinstance(sp, dict):
+            sp["postprocess"] = float((t_post1 - t_post0) * 1000.0)
+    except Exception:
+        pass
+
     response: Dict[str, Any] = {
         "customer_id": customer_id,
         "model_id": model_id,
@@ -637,6 +684,138 @@ async def classify(
 
     return JSONResponse(content=response)
 
+
+@app.post("/classify_batch")
+async def classify_batch(
+    request: Request,
+    files: Optional[list[UploadFile]] = File(default=None, description="List of image files to classify"),
+    customer_id: Optional[str] = Header(default=None),
+    model_id: Optional[str] = Header(default=None),
+    project_id: Optional[str] = Header(default=None),
+    classifier: Optional[str] = Header(default=None, description="Relative or absolute classifier path"),
+    gcs_bucket: Optional[str] = Header(default=None, description="GCS bucket containing the classifier when path is a blob"),
+    metadata: Optional[str] = Header(default=None, description="Optional path to metadata JSON containing labels"),
+    batch_size: Optional[int] = Query(default=16, ge=1, le=256, description="Max batch size for classification"),
+):
+    headers = request.headers
+    customer_id = customer_id or headers.get("customer_id") or headers.get("customer-id")
+    model_id = model_id or headers.get("model_id") or headers.get("model-id")
+    project_id = project_id or headers.get("project_id") or headers.get("project-id")
+    classifier = classifier or headers.get("classifier") or headers.get("model")
+    metadata = metadata or headers.get("metadata") or headers.get("meta")
+    gcs_bucket = gcs_bucket or headers.get("gcs_bucket") or headers.get("gcs-bucket") or os.getenv("GCS_BUCKET")
+
+    if classifier is None:
+        default_model = os.path.abspath(os.path.join(os.path.dirname(__file__), "axsy-classifier.pt"))
+        if not os.path.isfile(default_model):
+            raise HTTPException(status_code=400, detail="Missing required header: classifier (and default axsy-classifier.pt not found)")
+        classifier = default_model
+
+    model_path = resolve_model_path(
+        classifier,
+        gcs_bucket,
+        customer_id=customer_id,
+        model_id=model_id,
+        project_id=project_id,
+    )
+
+    model = await run_in_threadpool(load_classifier_cached, model_path)
+
+    if not files or len(files) == 0:
+        raise HTTPException(status_code=400, detail="Missing image files. Use form field 'files'.")
+
+    # Resolve device and input size
+    try:
+        inp_size = int(model.sizes[0].item())
+    except Exception:
+        inp_size = 32
+    try:
+        device = next(model.parameters()).device.type
+    except Exception:
+        device = "cpu"
+
+    # Read and decode images
+    pil_images: list[Image.Image] = []
+    indices: list[int] = []
+    for idx, uf in enumerate(files):
+        try:
+            contents = await uf.read()
+            img = Image.open(io.BytesIO(contents)).convert("RGB")
+            pil_images.append(img)
+            indices.append(idx)
+        except Exception:
+            pil_images.append(Image.new("RGB", (inp_size, inp_size)))
+            indices.append(idx)
+
+    # Batch through the list with the provided batch_size
+    from time import perf_counter
+    all_top_indices: list[int] = []
+    all_top_probs: list[float] = []
+    all_probs: list[list[float]] = []
+    total_pre_ms = 0.0
+    total_inf_ms = 0.0
+    for start in range(0, len(pil_images), int(batch_size or 16)):
+        chunk = pil_images[start : start + int(batch_size or 16)]
+        t0 = perf_counter()
+        batch_x = _prepare_image_tensor_batch(chunk, inp_size, device)
+        t1 = perf_counter()
+        from classifier import classify_image_batch
+        out = classify_image_batch(model, batch_x)
+        t2 = perf_counter()
+        total_pre_ms += float((t1 - t0) * 1000.0)
+        total_inf_ms += float((t2 - t1) * 1000.0)
+        all_top_indices.extend([int(v) for v in out.get("top_indices", [])])
+        all_top_probs.extend([float(v) for v in out.get("top_probs", [])])
+        probs_list = out.get("probs", []) or []
+        # Ensure nested lists of floats
+        for p in probs_list:
+            if isinstance(p, list):
+                all_probs.append([float(x) for x in p])
+            else:
+                all_probs.append([])
+
+    t_post0 = perf_counter()
+    labels = load_labels_for_classifier(
+        classifier,
+        model_path,
+        gcs_bucket,
+        customer_id,
+        model_id,
+        project_id,
+        metadata_value=metadata,
+    )
+
+    # Build per-item results
+    results = []
+    for i in range(len(pil_images)):
+        idx_val = int(all_top_indices[i]) if i < len(all_top_indices) else -1
+        prob_val = float(all_top_probs[i]) if i < len(all_top_probs) else 0.0
+        top_label = None
+        if labels and 0 <= idx_val < len(labels):
+            top_label = labels[idx_val]
+        elif labels:
+            top_label = labels[0]
+        results.append(
+            {
+                "top_index": idx_val,
+                "top_prob": prob_val,
+                **({"top_label": top_label} if top_label is not None else {}),
+                **({"probs": all_probs[i]} if i < len(all_probs) else {}),
+            }
+        )
+    t_post1 = perf_counter()
+    total_post_ms = float((t_post1 - t_post0) * 1000.0)
+
+    response: Dict[str, Any] = {
+        "customer_id": customer_id,
+        "model_id": model_id,
+        "project_id": project_id,
+        "classifier": classifier,
+        "speed_ms": {"preprocess": total_pre_ms, "inference": total_inf_ms, "postprocess": total_post_ms},
+        "results": results,
+    }
+
+    return JSONResponse(content=response)
 
 @app.get("/", response_class=HTMLResponse)
 async def upload_page():
