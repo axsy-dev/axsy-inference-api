@@ -9,13 +9,13 @@ set -euo pipefail
 #   PORT (default: 8080)
 #   UVICORN_WORKERS (default: 1)
 #   UVICORN_LOG_LEVEL (default: info)
-#   CPU (default: 1)
-#   MEMORY (default: 1Gi)
+#   CPU (default: 2)
+#   MEMORY (default: 2Gi)
 #   CONCURRENCY (default: 80)
 #   ALLOW_UNAUTH (default: true)
 #   REQUIRE_MODELS (default: true) - require axsy-yolo.pt and axsy-classifier.pt to exist
 
-PROJECT_ID=${1:-smart_vision_training}
+PROJECT_ID=${1:-smart-vision-training}
 REGION=${2:-europe-west1}
 SERVICE=${3:-axsy-inference}
 
@@ -31,8 +31,8 @@ IMAGE_URI="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${SERVICE}:${IMAGE_TAG
 PORT=${PORT:-8080}
 UVICORN_WORKERS=${UVICORN_WORKERS:-1}
 UVICORN_LOG_LEVEL=${UVICORN_LOG_LEVEL:-info}
-CPU=${CPU:-1}
-MEMORY=${MEMORY:-1Gi}
+CPU=${CPU:-2}
+MEMORY=${MEMORY:-2Gi}
 CONCURRENCY=${CONCURRENCY:-80}
 ALLOW_UNAUTH=${ALLOW_UNAUTH:-true}
 REQUIRE_MODELS=${REQUIRE_MODELS:-true}
