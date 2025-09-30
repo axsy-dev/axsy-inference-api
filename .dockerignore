@@ -26,6 +26,8 @@ npm-debug.log
 # Local credentials and large artifacts
 smart-vision-trainiing-sa.json
 *.pt
+!axsy-yolo.pt
+!axsy-classifier.pt
 *.onnx
 *.bin
 *.weights
