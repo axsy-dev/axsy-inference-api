@@ -14,7 +14,7 @@ set -euo pipefail
 #   CONCURRENCY (default: 80)
 #   ALLOW_UNAUTH (default: true)
 
-PROJECT_ID=${1:-smart_vision_training}
+PROJECT_ID=${1:-smart-vision-training}
 REGION=${2:-europe-west1}
 SERVICE=${3:-axsy-inference}
 

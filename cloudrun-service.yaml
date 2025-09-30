@@ -6,7 +6,7 @@ spec:
   template:
     spec:
       containers:
-        - image: europe-west1-docker.pkg.dev/smart_vision_training/containers/axsy-inference:latest
+        - image: europe-west1-docker.pkg.dev/smart-vision-training/containers/axsy-inference:latest
           env:
             - name: GOOGLE_APPLICATION_CREDENTIALS
               value: /app/smart-vision-training-sa.json
