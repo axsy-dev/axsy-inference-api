@@ -14,8 +14,8 @@ set -euo pipefail
 #   CONCURRENCY (default: 80)
 #   ALLOW_UNAUTH (default: true)
 
-PROJECT_ID=${1:-}
-REGION=${2:-}
+PROJECT_ID=${1:-smart_vision_training}
+REGION=${2:-europe-west1}
 SERVICE=${3:-axsy-inference}
 
 if [[ -z "${PROJECT_ID}" || -z "${REGION}" ]]; then
@@ -55,7 +55,7 @@ ARGS=(
   --cpu="$CPU"
   --memory="$MEMORY"
   --concurrency="$CONCURRENCY"
-  --set-env-vars "UVICORN_WORKERS=${UVICORN_WORKERS},UVICORN_LOG_LEVEL=${UVICORN_LOG_LEVEL}"
+  --set-env-vars "GOOGLE_APPLICATION_CREDENTIALS=/app/smart-vision-training-sa.json,UVICORN_WORKERS=${UVICORN_WORKERS},UVICORN_LOG_LEVEL=${UVICORN_LOG_LEVEL}"
   --timeout=600
 )
 

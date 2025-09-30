@@ -6,8 +6,10 @@ spec:
   template:
     spec:
       containers:
-        - image: REGION-docker.pkg.dev/PROJECT_ID/REPO/axsy-inference:latest
+        - image: europe-west1-docker.pkg.dev/smart_vision_training/containers/axsy-inference:latest
           env:
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: /app/smart-vision-training-sa.json
             - name: UVICORN_WORKERS
               value: "1"
             - name: UVICORN_LOG_LEVEL
