@@ -91,39 +91,32 @@ Operational notes
 - The API is multi-user safe: model downloads are serialized per file, models are cached, and inference runs under a per‑model lock in a threadpool.
 - Keep `smart-vision-trainiing-sa.json` and large model weights out of git.
 
-Production (PM2)
-----------------
-Use PM2 to manage the API in production.
+Deploy to Google Cloud Run
+--------------------------
 
-1) Install PM2 globally (once):
+Prerequisites:
+- Install and initialize gcloud (`https://cloud.google.com/sdk/docs/install`).
+- Enable APIs:
+  ```bash
+  gcloud services enable artifactregistry.googleapis.com run.googleapis.com cloudbuild.googleapis.com
+  ```
 
-```bash
-npm i -g pm2
-```
-
-2) Start the service:
-
-```bash
-/home/ec2-user/axsy_inference/scripts/start.sh
-```
-
-3) Check status and logs:
+Build and deploy using Cloud Build + Artifact Registry:
 
 ```bash
-pm2 status axsy-inference
-pm2 logs axsy-inference
+# From repo root
+./cloudrun-deploy.sh <PROJECT_ID> <REGION> axsy-inference
+# Example:
+# ./cloudrun-deploy.sh my-gcp-project europe-west1 axsy-inference
 ```
 
-4) Stop the service:
+Notes:
+- The Docker image listens on `PORT` (default 8080) and starts `uvicorn server:get_app --factory`.
+- To pass runtime env vars (e.g. workers/log level) edit `cloudrun-deploy.sh` or run:
+  ```bash
+  gcloud run deploy axsy-inference \
+    --set-env-vars "UVICORN_WORKERS=1,UVICORN_LOG_LEVEL=info" \
+    --project <PROJECT_ID> --region <REGION>
+  ```
 
-```bash
-/home/ec2-user/axsy_inference/scripts/stop.sh
-```
-
-5) Persist across reboots (once):
-
-```bash
-pm2 save
-pm2 startup  # follow the printed instructions
-```
 

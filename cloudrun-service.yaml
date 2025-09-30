@@ -1,0 +1,19 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: axsy-inference
+spec:
+  template:
+    spec:
+      containers:
+        - image: REGION-docker.pkg.dev/PROJECT_ID/REPO/axsy-inference:latest
+          env:
+            - name: UVICORN_WORKERS
+              value: "1"
+            - name: UVICORN_LOG_LEVEL
+              value: info
+          ports:
+            - name: http1
+              containerPort: 8080
+      containerConcurrency: 80
+      timeoutSeconds: 600
