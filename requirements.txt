@@ -1,5 +1,6 @@
 fastapi
 uvicorn
+python-multipart
 pillow
 ultralytics
 google-cloud-storage
