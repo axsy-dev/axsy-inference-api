@@ -1,0 +1,39 @@
+# Files ignored when uploading source with gcloud builds submit
+# See: gcloud topic gcloudignore
+
+# VCS
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+.venv
+venv
+ENV
+env
+
+# Node/OS/editor
+node_modules
+npm-debug.log
+.DS_Store
+*.swp
+*.swo
+
+# Caches
+.cache
+ultralytics
+
+# Large model artifacts (excluded by default) — allow the two defaults
+*.pt
+!axsy-yolo.pt
+!axsy-classifier.pt
+*.onnx
+*.bin
+*.weights
+*.ckpt
+*.tflite
