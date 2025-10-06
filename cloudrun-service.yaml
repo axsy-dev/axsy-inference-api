@@ -4,18 +4,26 @@ metadata:
   name: axsy-inference
 spec:
   template:
+    metadata:
+      annotations:
+        run.googleapis.com/execution-environment: gen2
+        run.googleapis.com/cpu-throttling: "false"
     spec:
       containers:
         - image: europe-west1-docker.pkg.dev/smart-vision-training/containers/axsy-inference:latest
           env:
             - name: GOOGLE_APPLICATION_CREDENTIALS
-              value: /app/smart-vision-training-sa.json
+              value: /app/smart-vision-trainiing-sa.json
             - name: UVICORN_WORKERS
               value: "1"
             - name: UVICORN_LOG_LEVEL
               value: info
+          resources:
+            limits:
+              cpu: "2"
+              memory: 8Gi
           ports:
             - name: http1
               containerPort: 8080
-      containerConcurrency: 80
+      containerConcurrency: 1
       timeoutSeconds: 600

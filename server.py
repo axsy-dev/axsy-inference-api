@@ -3,6 +3,7 @@ import json
 import os
 import threading
 from functools import lru_cache
+import logging
 from typing import Any, Dict, Optional, List
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile, Request, Query
@@ -17,6 +18,9 @@ except Exception:
 
 
 app = FastAPI(title="Axsy Inference API")
+
+# Logger
+logger = logging.getLogger("uvicorn.error")
 
 # Global locks for concurrency safety
 _global_lock = threading.Lock()
@@ -166,9 +170,33 @@ def _ensure_storage_client(project_id: Optional[str] = None) -> "storage.Client"
             ),
         )
     try:
+        creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        if creds_path:
+            try:
+                exists = os.path.isfile(creds_path)
+            except Exception:
+                exists = False
+            logger.info("GCS: using GOOGLE_APPLICATION_CREDENTIALS=%s (exists=%s)", creds_path, exists)
+            if exists:
+                try:
+                    # Prefer explicit JSON when present
+                    return storage.Client.from_service_account_json(creds_path)
+                except Exception as exc:
+                    logger.exception("GCS: Failed to init client from JSON %s: %s; falling back to ADC", creds_path, exc)
+            # If path is missing or failed to load, ensure env var does not force google.auth to try it
+            logger.warning("GCS: credentials file path does not exist or failed, clearing env and using ADC: %s", creds_path)
+            prev = os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
+            try:
+                return storage.Client()
+            finally:
+                if prev is not None:
+                    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = prev
+        else:
+            logger.info("GCS: GOOGLE_APPLICATION_CREDENTIALS not set; using default application credentials")
         # Always rely on credentials' default project to avoid header mismatch
         return storage.Client()
     except Exception as exc:
+        logger.exception("GCS: Failed to init storage client: %s", exc)
         raise HTTPException(status_code=500, detail=f"Failed to init GCS client: {exc}")
 
 
@@ -176,7 +204,9 @@ def _download_blob_to_cache(bucket_name: str, blob_path: str, project_id: Option
     client = _ensure_storage_client(None)
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(blob_path)
+    logger.info("GCS: resolving gs://%s/%s", bucket_name, blob_path)
     if not blob.exists():
+        logger.error("GCS: object not found gs://%s/%s", bucket_name, blob_path)
         raise HTTPException(
             status_code=404,
             detail=f"Model object not found in GCS: gs://{bucket_name}/{blob_path}",
@@ -192,9 +222,15 @@ def _download_blob_to_cache(bucket_name: str, blob_path: str, project_id: Option
     lock = _get_lock(_download_locks, local_path)
     with lock:
         if os.path.isfile(local_path) and os.path.getsize(local_path) > 0:
+            logger.info("GCS: using cached file %s", local_path)
             return local_path
-        blob.download_to_filename(local_path)
-        return local_path
+        try:
+            blob.download_to_filename(local_path)
+            logger.info("GCS: downloaded gs://%s/%s -> %s", bucket_name, blob_path, local_path)
+            return local_path
+        except Exception as exc:
+            logger.exception("GCS: download failed for gs://%s/%s: %s", bucket_name, blob_path, exc)
+            raise HTTPException(status_code=500, detail=f"Failed to download GCS object: {exc}")
 
 
 def resolve_model_path(
@@ -473,7 +509,8 @@ def _reclassify_products(
         total_inf_ms = float((t2 - t1) * 1000.0)
         total_post_ms = float((t3 - t2) * 1000.0)
         count = len(prod_indices)
-    except Exception:
+    except Exception as exc:
+        logger.exception("Reclassify: batch classification failed: %s", exc)
         # Fail-open: leave detections as-is
         return {"num": 0, "speed_ms": {"preprocess": None, "inference": None, "postprocess": None}}
     return {
@@ -584,8 +621,8 @@ async def infer(
             )
             if isinstance(re_stats, dict):
                 inference["reclassify"] = re_stats
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.exception("Reclassify: skipped due to error: %s", exc)
 
     response: Dict[str, Any] = {
         "customer_id": customer_id,
