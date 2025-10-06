@@ -5,6 +5,7 @@ import threading
 from functools import lru_cache
 import logging
 from typing import Any, Dict, Optional, List
+import base64
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile, Request, Query
 from fastapi.concurrency import run_in_threadpool
@@ -159,6 +160,219 @@ def load_labels_for_classifier(
 
     # 4) Fallback
     return load_classifier_labels()
+
+
+# --- Gemini (image review) support ---
+def _ensure_gemini_client(api_key: Optional[str] = None):
+    """Lazily import and configure the Google Generative AI client.
+
+    The API key is resolved from (in order):
+    - Explicit parameter
+    - Environment variable `GEMINI_API_KEY`
+    - Header fallback is handled by the endpoint before calling here
+    - Final fallback is a built-in default provided by the user
+    """
+    try:
+        import google.generativeai as genai  # type: ignore
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"google-generativeai not installed: {exc}")
+
+    key = (
+        api_key
+        or os.getenv("GEMINI_API_KEY")
+        or "AIzaSyAWCj89Xci6__o3rT0QR6F9p7PTe_nKjzw"
+    )
+    if not key:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not configured")
+    try:
+        genai.configure(api_key=key)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to configure Gemini client: {exc}")
+    return genai
+
+
+def _review_with_gemini(image_bytes: bytes, mime_type: str, api_key: Optional[str], want_regions: bool = False) -> Dict[str, Any]:
+    genai = _ensure_gemini_client(api_key)
+    try:
+        # Prefer structured JSON output. If the SDK/version does not support response_schema,
+        # we still request JSON via response_mime_type.
+        generation_config: Dict[str, Any] = {
+            "response_mime_type": "application/json",
+        }
+        try:
+            # Newer SDKs support response_schema for stricter typing
+            generation_config["response_schema"] = {
+                "type": "object",
+                "properties": {
+                    "quality_percent": {"type": "number"},
+                    "analysis": {"type": "string"},
+                    "advice": {"type": "string"},
+                    "flags": {
+                        "type": "object",
+                        "properties": {
+                            "products_visible": {"type": "boolean"},
+                            "shelves_horizontal": {"type": "boolean"},
+                            "low_clutter": {"type": "boolean"},
+                            "price_tags_visible": {"type": "boolean"},
+                            "mostly_tobacco_products": {"type": "boolean"},
+                            "unobstructed_products": {"type": "boolean"},
+                            "straight_on_view": {"type": "boolean"}
+                        },
+                        "required": [
+                            "products_visible",
+                            "shelves_horizontal",
+                            "low_clutter"
+                        ],
+                    },
+                    "issues": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    },
+                    "issue_regions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string"},
+                                "severity": {"type": "string"},
+                                "box": {
+                                    "type": "object",
+                                    "properties": {
+                                        "left": {"type": "number"},
+                                        "top": {"type": "number"},
+                                        "right": {"type": "number"},
+                                        "bottom": {"type": "number"}
+                                    },
+                                    "required": ["left", "top", "right", "bottom"]
+                                }
+                            },
+                            "required": ["label", "box"]
+                        }
+                    },
+                    "notes": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["quality_percent", "analysis", "flags"],
+            }
+        except Exception:
+            pass
+
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        prompt = (
+            "You are reviewing a retail shelf photo for suitability before object detection. "
+            "Assess these points: (1) products are clearly visible; (2) shelves are roughly horizontal; "
+            "(3) minimal clutter/extra products not on shelves; (4) price tags/labels are visible on the shelves; "
+            "(5) the scene is mostly cigarettes and smokeless tobacco products (e.g., cigarette packs, cigars, rolling tobacco, snus); "
+            "(6) nothing obstructs the view of products (no people or unrelated objects blocking); "
+            "(7) the photo is taken roughly straight-on (not a strong vanishing perspective or heavy off-angle). "
+            "Return strict JSON with: quality_percent (0-100, integer-like), analysis (brief 1-2 sentences), "
+            "flags {products_visible, shelves_horizontal, low_clutter, price_tags_visible, mostly_tobacco_products, unobstructed_products, straight_on_view}, "
+            "an 'advice' field: short actionable tips to retake the photo when any checks fail; include cropping guidance inside the advice only when the frame includes irrelevant areas; if none fail, set advice to 'good job'. "
+            "Additionally, provide 'issues' (short phrases) and 'issue_regions' listing problem areas with normalized boxes {left, top, right, bottom} in 0..1 for visualization; omit these only if absolutely uncertain. "
+            "The quality_percent should reflect all checks with emphasis on product clarity, shelf alignment, and unobstructed straight-on view."
+        )
+        if want_regions:
+            prompt += " Always include 'issue_regions' for any failed checks; if no issues are found, return an empty array."
+
+        response = model.generate_content(
+            [
+                prompt,
+                {"mime_type": mime_type or "image/jpeg", "data": image_bytes},
+            ],
+            generation_config=generation_config,
+        )
+
+        text = getattr(response, "text", None) or getattr(response, "output_text", None)
+        if not text:
+            # Some SDK versions return candidates with content parts
+            try:
+                text = response.candidates[0].content.parts[0].text
+            except Exception:
+                text = "{}"
+
+        try:
+            payload = json.loads(text)
+            if isinstance(payload, dict):
+                # Normalize field name variants
+                if "quality" in payload and "quality_percent" not in payload:
+                    payload["quality_percent"] = payload.get("quality")
+                # Clamp/format
+                try:
+                    qp = float(payload.get("quality_percent", 0.0))
+                    payload["quality_percent"] = float(max(0.0, min(100.0, qp)))
+                except Exception:
+                    payload["quality_percent"] = 0.0
+                if not isinstance(payload.get("analysis"), str):
+                    payload["analysis"] = str(payload.get("analysis", ""))
+                if not isinstance(payload.get("advice"), str):
+                    payload["advice"] = ""
+                # Ensure no leftover crop fields (we now include cropping only in advice)
+                if "crop_instructions" in payload:
+                    payload.pop("crop_instructions", None)
+                if "crop_box" in payload:
+                    payload.pop("crop_box", None)
+                # Validate issue regions
+                regions = []
+                try:
+                    for reg in payload.get("issue_regions", []) or []:
+                        if not isinstance(reg, dict):
+                            continue
+                        lab = str(reg.get("label", "issue"))
+                        box = reg.get("box") or {}
+                        l = float(box.get("left", 0.0))
+                        t = float(box.get("top", 0.0))
+                        r = float(box.get("right", 1.0))
+                        b = float(box.get("bottom", 1.0))
+                        l = max(0.0, min(1.0, l))
+                        t = max(0.0, min(1.0, t))
+                        r = max(0.0, min(1.0, r))
+                        b = max(0.0, min(1.0, b))
+                        if r < l:
+                            l, r = r, l
+                        if b < t:
+                            t, b = b, t
+                        regions.append({"label": lab, "box": {"left": l, "top": t, "right": r, "bottom": b}})
+                except Exception:
+                    regions = []
+                if regions:
+                    payload["issue_regions"] = regions
+                else:
+                    payload.pop("issue_regions", None)
+
+                if not isinstance(payload.get("flags"), dict):
+                    payload["flags"] = {}
+                return payload
+        except Exception:
+            pass
+
+        # Fallback: return as plain analysis
+        return {
+            "quality_percent": 0.0,
+            "analysis": str(text or ""),
+            "flags": {
+                "products_visible": False,
+                "shelves_horizontal": False,
+                "low_clutter": False,
+            },
+            "advice": "Please retake the photo: ensure a straight-on view, avoid obstructions, show price tags, and reduce clutter.",
+            "crop_instructions": "Crop tightly to the tobacco shelves; exclude counter, people, and unrelated areas.",
+            "crop_box": None,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Gemini review failed: %s", exc)
+        return {
+            "quality_percent": 0.0,
+            "analysis": f"Gemini error: {exc}",
+            "flags": {
+                "products_visible": False,
+                "shelves_horizontal": False,
+                "low_clutter": False,
+            },
+            "advice": "Please retake the photo: ensure a straight-on view, avoid obstructions, show price tags, and reduce clutter.",
+            "crop_instructions": "Crop tightly to the tobacco shelves; exclude counter, people, and unrelated areas.",
+            "crop_box": None,
+        }
 
 
 def _ensure_storage_client(project_id: Optional[str] = None) -> "storage.Client":
@@ -720,6 +934,112 @@ async def classify(
     }
 
     return JSONResponse(content=response)
+
+
+@app.post("/review")
+async def review(
+    request: Request,
+    file: Optional[UploadFile] = File(default=None, description="Image file to review"),
+    image: Optional[UploadFile] = File(default=None, description="Alternative field name for the image"),
+    gemini_api_key: Optional[str] = Header(default=None, description="API key for Gemini (optional; defaults to env GEMINI_API_KEY)"),
+    return_overlay: Optional[bool] = Header(default=None, description="If true, include a base64 PNG overlay that highlights issues"),
+):
+    headers = request.headers
+    # Allow alternate header names
+    gemini_api_key = gemini_api_key or headers.get("gemini_api_key") or headers.get("gemini-api-key")
+
+    selected = file if file is not None else image
+    if selected is None:
+        raise HTTPException(status_code=400, detail="Missing image file. Use form field 'file' or 'image'.")
+
+    try:
+        contents = await selected.read()
+        # Best-effort mime type from upload metadata
+        mime = getattr(selected, "content_type", None) or "image/jpeg"
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not read image: {exc}")
+
+    # Determine if caller wants overlay; this also hints Gemini to return regions
+    want_overlay = False
+    v = headers.get("return_overlay") or headers.get("return-overlay")
+    if isinstance(v, str):
+        want_overlay = v.strip().lower() in ("1", "true", "yes", "on")
+    if return_overlay is not None:
+        want_overlay = bool(return_overlay)
+
+    result = await run_in_threadpool(_review_with_gemini, contents, mime, gemini_api_key, want_overlay)
+
+    # Normalize top-level response
+    try:
+        qp = float(result.get("quality_percent", 0.0))
+    except Exception:
+        qp = 0.0
+    qp = max(0.0, min(100.0, qp))
+    analysis = str(result.get("analysis", ""))
+    flags = result.get("flags", {}) if isinstance(result.get("flags"), dict) else {}
+    # Ensure the new flags exist even if model omitted them
+    for k in ("products_visible", "shelves_horizontal", "low_clutter", "price_tags_visible", "mostly_tobacco_products", "unobstructed_products", "straight_on_view"):
+        if k not in flags:
+            flags[k] = False
+    advice = result.get("advice") if isinstance(result.get("advice"), str) else None
+    if not advice:
+        # Synthesize simple advice locally if missing
+        failing = [
+            ("products_visible", "move closer and ensure products are in focus"),
+            ("shelves_horizontal", "hold the camera level so shelves are horizontal"),
+            ("low_clutter", "avoid extra items not on the shelves"),
+            ("price_tags_visible", "frame shelves so price tags are clearly visible"),
+            ("mostly_tobacco_products", "center cigarette and smokeless tobacco sections"),
+            ("unobstructed_products", "make sure no people or objects block products"),
+            ("straight_on_view", "shoot straight-on, avoid steep angles or vanishing perspective"),
+        ]
+        tips = [msg for key, msg in failing if not bool(flags.get(key))]
+        # Add cropping advice only when clutter or unobstructed flags fail
+        if (not bool(flags.get("low_clutter"))) or (not bool(flags.get("unobstructed_products"))):
+            tips.append("crop tightly to the tobacco shelves and exclude counter/people/irrelevant areas")
+        advice = "good job" if not tips else ("; ".join(tips) + ". Please retake and resubmit.")
+
+    # Optionally produce a simple overlay marking issue regions
+    overlay_b64: Optional[str] = None
+    try:
+        if bool(want_overlay):
+            try:
+                from PIL import ImageDraw
+                img = Image.open(io.BytesIO(contents)).convert("RGB")
+                draw = ImageDraw.Draw(img)
+                iw, ih = img.width, img.height
+                color = (255, 0, 0)
+                for reg in result.get("issue_regions", []) or []:
+                    box = reg.get("box") or {}
+                    x1 = float(box.get("left", 0.0)) * iw
+                    y1 = float(box.get("top", 0.0)) * ih
+                    x2 = float(box.get("right", 1.0)) * iw
+                    y2 = float(box.get("bottom", 1.0)) * ih
+                    draw.rectangle([x1, y1, x2, y2], outline=color, width=max(2, int(min(iw, ih) * 0.004)))
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                overlay_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+            except Exception:
+                overlay_b64 = None
+        else:
+            overlay_b64 = None
+    except Exception:
+        overlay_b64 = None
+
+    if want_overlay and not overlay_b64:
+        logger.info("/review: overlay requested but not available (no regions or rendering failed)")
+    elif want_overlay and overlay_b64:
+        logger.info("/review: overlay generated (%d bytes)", len(overlay_b64))
+
+    return JSONResponse(
+        content={
+            "quality_percent": qp,
+            "analysis": analysis,
+            "flags": flags,
+            "advice": advice,
+            **({"overlay_png_base64": overlay_b64} if overlay_b64 else {}),
+        }
+    )
 
 
 @app.post("/classify_batch")
