@@ -224,6 +224,23 @@ def _review_with_gemini(image_bytes: bytes, mime_type: str, api_key: Optional[st
                             "low_clutter"
                         ],
                     },
+                    "products": {
+                        "type": "object",
+                        "properties": {
+                            "total_count": {"type": "number"},
+                            "by_label": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": {"type": "string"},
+                                        "count": {"type": "number"}
+                                    },
+                                    "required": ["label", "count"]
+                                }
+                            }
+                        }
+                    },
                     "issues": {
                         "type": "array",
                         "items": {"type": "string"}
@@ -267,6 +284,7 @@ def _review_with_gemini(image_bytes: bytes, mime_type: str, api_key: Optional[st
             "Return strict JSON with: quality_percent (0-100, integer-like), analysis (brief 1-2 sentences), "
             "flags {products_visible, shelves_horizontal, low_clutter, price_tags_visible, mostly_tobacco_products, unobstructed_products, straight_on_view}, "
             "an 'advice' field: short actionable tips to retake the photo when any checks fail; include cropping guidance inside the advice only when the frame includes irrelevant areas; if none fail, set advice to 'good job'. "
+            "If and only if the photo meets the requirements (all checks pass), also identify the visible tobacco/smokeless products and return 'products' with 'total_count' and 'by_label' (array of {label, count}); otherwise omit 'products'. "
             "Additionally, provide 'issues' (short phrases) and 'issue_regions' listing problem areas with normalized boxes {left, top, right, bottom} in 0..1 for visualization; omit these only if absolutely uncertain. "
             "The quality_percent should reflect all checks with emphasis on product clarity, shelf alignment, and unobstructed straight-on view."
         )
@@ -943,6 +961,14 @@ async def review(
     image: Optional[UploadFile] = File(default=None, description="Alternative field name for the image"),
     gemini_api_key: Optional[str] = Header(default=None, description="API key for Gemini (optional; defaults to env GEMINI_API_KEY)"),
     return_overlay: Optional[bool] = Header(default=None, description="If true, include a base64 PNG overlay that highlights issues"),
+    # Optional model headers used only when we need to list shelf products after a pass
+    customer_id: Optional[str] = Header(default=None),
+    model_id: Optional[str] = Header(default=None),
+    project_id: Optional[str] = Header(default=None),
+    detector: Optional[str] = Header(default=None, description="Relative or absolute detector path (optional)"),
+    gcs_bucket: Optional[str] = Header(default=None, description="GCS bucket when using blob paths (optional)"),
+    classifier: Optional[str] = Header(default=None, description="Relative or absolute classifier path (optional)"),
+    metadata: Optional[str] = Header(default=None, description="Optional path to metadata JSON containing labels"),
 ):
     headers = request.headers
     # Allow alternate header names
@@ -1031,15 +1057,48 @@ async def review(
     elif want_overlay and overlay_b64:
         logger.info("/review: overlay generated (%d bytes)", len(overlay_b64))
 
-    return JSONResponse(
-        content={
-            "quality_percent": qp,
-            "analysis": analysis,
-            "flags": flags,
-            "advice": advice,
-            **({"overlay_png_base64": overlay_b64} if overlay_b64 else {}),
-        }
+    # If image meets all requirements, count and list tobacco products on shelves
+    accepted = (
+        bool(flags.get("products_visible")) and
+        bool(flags.get("shelves_horizontal")) and
+        bool(flags.get("low_clutter")) and
+        bool(flags.get("price_tags_visible")) and
+        bool(flags.get("mostly_tobacco_products")) and
+        bool(flags.get("unobstructed_products")) and
+        bool(flags.get("straight_on_view"))
     )
+
+    products_summary: Optional[Dict[str, Any]] = None
+    if accepted:
+        # Prefer Gemini-provided products if present
+        try:
+            prod = result.get("products")
+            if isinstance(prod, dict):
+                total = int(prod.get("total_count", 0))
+                items = prod.get("by_label", []) or []
+                cleaned = []
+                for it in items:
+                    if isinstance(it, dict) and "label" in it and "count" in it:
+                        try:
+                            cleaned.append({"label": str(it["label"]), "count": int(it["count"])})
+                        except Exception:
+                            continue
+                products_summary = {"total_count": total, "by_label": cleaned}
+        except Exception:
+            products_summary = None
+
+    response: Dict[str, Any] = {
+        "quality_percent": qp,
+        "analysis": analysis,
+        "flags": flags,
+        "advice": advice,
+        **({"overlay_png_base64": overlay_b64} if overlay_b64 else {}),
+        "accepted": bool(accepted),
+    }
+    if products_summary is not None:
+        response["products"] = products_summary
+
+    return JSONResponse(content=response)
 
 
 @app.post("/classify_batch")
