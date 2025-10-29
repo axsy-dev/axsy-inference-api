@@ -234,9 +234,11 @@ def _review_with_gemini(image_bytes: bytes, mime_type: str, api_key: Optional[st
                                     "type": "object",
                                     "properties": {
                                         "label": {"type": "string"},
+                                        "facing_count": {"type": "number"},
+                                        "manufacturer": {"type": "string"},
                                         "count": {"type": "number"}
                                     },
-                                    "required": ["label", "count"]
+                                    "required": ["label", "facing_count"]
                                 }
                             }
                         }
@@ -278,13 +280,16 @@ def _review_with_gemini(image_bytes: bytes, mime_type: str, api_key: Optional[st
             "You are reviewing a retail shelf photo for suitability before object detection. "
             "Assess these points: (1) products are clearly visible; (2) shelves are roughly horizontal; "
             "(3) minimal clutter/extra products not on shelves; (4) price tags/labels are visible on the shelves; "
-            "(5) the scene is mostly cigarettes and smokeless tobacco products (e.g., cigarette packs, cigars, rolling tobacco, snus); "
-            "(6) nothing obstructs the view of products (no people or unrelated objects blocking); "
-            "(7) the photo is taken roughly straight-on (not a strong vanishing perspective or heavy off-angle). "
+            "(5) the scene is mostly tobacco/smokeless or vaping products (e.g., cigarette packs, cigars, rolling tobacco, snus; plus vaping items such as e-cigarettes, pods, disposables, e-liquid bottles, vape devices); "
+            "(6) nothing obstructs the view of products (no people or unrelated objects blocking a substantial portion of shelf facings—small edges, pegs, or minor glare are acceptable); "
+            "(7) the photo is taken roughly straight-on (minor off‑angle within about ±20° is acceptable). "
+            "Acceptance policy: CORE checks are products_visible, shelves_horizontal, low_clutter, straight_on_view. SOFT checks are price_tags_visible, mostly_tobacco_products, unobstructed_products. The image is acceptable when all CORE checks pass and at most one SOFT check fails. "
             "Return strict JSON with: quality_percent (0-100, integer-like), analysis (brief 1-2 sentences), "
             "flags {products_visible, shelves_horizontal, low_clutter, price_tags_visible, mostly_tobacco_products, unobstructed_products, straight_on_view}, "
             "an 'advice' field: short actionable tips to retake the photo when any checks fail; include cropping guidance inside the advice only when the frame includes irrelevant areas; if none fail, set advice to 'good job'. "
-            "If and only if the photo meets the requirements (all checks pass), also identify the visible tobacco/smokeless products and return 'products' with 'total_count' and 'by_label' (array of {label, count}); otherwise omit 'products'. "
+            "If and only if the photo is acceptable by the above policy (ALL CORE checks pass and at most one SOFT check fails), also identify the visible tobacco/smokeless/vaping products and return 'products' with 'total_count' and 'by_label' (array of {label, facing_count, manufacturer?}). Only count front-facing facings; do not multiply by depth of packs behind the front row. Use the key 'facing_count' (not 'count'). Otherwise omit 'products'. "
+            "Definition for mostly_tobacco_products: count heated-tobacco sticks and devices (e.g., IQOS, HEETS, TEREA, Fiit), nicotine pouches (e.g., ZYN), snus, snuff, chewing tobacco, cigarettes, cigars, cigarillos, rolling tobacco, and vaping products (e-cigarettes, pod systems, disposable vapes, e-liquid bottles, vape devices) as in-scope. Brand signage or price boards do not negate this. "
+            "Set mostly_tobacco_products to true when approximately ≥60% of visible shelf facings are these items—even if adjacent marketing panels or device images are present. When in doubt and the display is dominated by these items, prefer true. "
             "Additionally, provide 'issues' (short phrases) and 'issue_regions' listing problem areas with normalized boxes {left, top, right, bottom} in 0..1 for visualization; omit these only if absolutely uncertain. "
             "The quality_percent should reflect all checks with emphasis on product clarity, shelf alignment, and unobstructed straight-on view."
         )
@@ -298,6 +303,32 @@ def _review_with_gemini(image_bytes: bytes, mime_type: str, api_key: Optional[st
             ],
             generation_config=generation_config,
         )
+
+        # Capture token usage if provided by SDK
+        usage: Dict[str, int] = {}
+        try:
+            um = getattr(response, "usage_metadata", None)
+            if um is not None:
+                # Try both old and new field names
+                in_count = getattr(um, "input_token_count", None)
+                if in_count is None:
+                    in_count = getattr(um, "prompt_token_count", None)
+                out_count = getattr(um, "output_token_count", None)
+                if out_count is None:
+                    out_count = getattr(um, "candidates_token_count", None)
+                total_count = getattr(um, "total_token_count", None)
+                if total_count is None and (in_count is not None or out_count is not None):
+                    try:
+                        total_count = int((in_count or 0)) + int((out_count or 0))
+                    except Exception:
+                        total_count = None
+                usage = {
+                    "input": int(in_count or 0),
+                    "output": int(out_count or 0),
+                    "total": int(total_count or 0) if total_count is not None else int((in_count or 0) + (out_count or 0)),
+                }
+        except Exception:
+            usage = {}
 
         text = getattr(response, "text", None) or getattr(response, "output_text", None)
         if not text:
@@ -358,6 +389,8 @@ def _review_with_gemini(image_bytes: bytes, mime_type: str, api_key: Optional[st
 
                 if not isinstance(payload.get("flags"), dict):
                     payload["flags"] = {}
+                if usage:
+                    payload["token_usage"] = usage
                 return payload
         except Exception:
             pass
@@ -374,6 +407,7 @@ def _review_with_gemini(image_bytes: bytes, mime_type: str, api_key: Optional[st
             "advice": "Please retake the photo: ensure a straight-on view, avoid obstructions, show price tags, and reduce clutter.",
             "crop_instructions": "Crop tightly to the tobacco shelves; exclude counter, people, and unrelated areas.",
             "crop_box": None,
+            **({"token_usage": usage} if usage else {}),
         }
     except HTTPException:
         raise
@@ -390,6 +424,7 @@ def _review_with_gemini(image_bytes: bytes, mime_type: str, api_key: Optional[st
             "advice": "Please retake the photo: ensure a straight-on view, avoid obstructions, show price tags, and reduce clutter.",
             "crop_instructions": "Crop tightly to the tobacco shelves; exclude counter, people, and unrelated areas.",
             "crop_box": None,
+            **({"token_usage": usage} if usage else {}),
         }
 
 
@@ -550,8 +585,8 @@ def _prepare_image_tensor_batch(pil_images: list[Image.Image], size: int, device
     x = torch.from_numpy(bchw).to(device, non_blocking=non_blocking)
     return x
 
-def run_yolo_inference(model: YOLO, pil_image: Image.Image):
-    results = model(pil_image)
+def run_yolo_inference(model: YOLO, pil_image: Image.Image, conf_threshold: float = 0.9):
+    results = model(pil_image, conf=conf_threshold)
     if not results:
         return {
             "image": {"width": None, "height": None},
@@ -623,7 +658,7 @@ def run_yolo_inference(model: YOLO, pil_image: Image.Image):
     }
 
 
-def _run_inference_threadsafe(model_path: str, model: YOLO, pil_image: Image.Image) -> Dict[str, Any]:
+def _run_inference_threadsafe(model_path: str, model: YOLO, pil_image: Image.Image, conf_threshold: float = 0.9) -> Dict[str, Any]:
     """Run inference under a per-model lock to ensure thread-safety.
 
     This prevents concurrent model() calls on the same model instance which
@@ -631,7 +666,7 @@ def _run_inference_threadsafe(model_path: str, model: YOLO, pil_image: Image.Ima
     """
     lock = _get_lock(_model_locks, model_path)
     with lock:
-        return run_yolo_inference(model, pil_image)
+        return run_yolo_inference(model, pil_image, conf_threshold)
 
 
 def _run_classification_threadsafe(model_path: str, model, pil_image: Image.Image) -> Dict[str, Any]:
@@ -764,6 +799,7 @@ async def infer(
     reclassify_products: Optional[bool] = Header(default=None, description="If true, reclassify 'product' detections with classifier"),
     classifier: Optional[str] = Header(default=None, description="Relative or absolute classifier path for reclassification"),
     metadata: Optional[str] = Header(default=None, description="Optional path to metadata JSON containing labels for classifier reclassification"),
+    confidence_threshold: Optional[float] = Header(default=None, description="Confidence threshold for YOLO detections (0.0-1.0, default 0.9)"),
 ):
     # Fallback to header variants if not provided via explicit Header params
     headers = request.headers
@@ -776,6 +812,20 @@ async def infer(
     # Optional classifier/metadata headers for reclassification
     classifier = classifier or headers.get("classifier") or headers.get("model")
     metadata = metadata or headers.get("metadata") or headers.get("meta")
+    # Confidence threshold handling
+    conf_threshold = confidence_threshold
+    if conf_threshold is None:
+        conf_header = headers.get("confidence_threshold") or headers.get("confidence-threshold")
+        if conf_header is not None:
+            try:
+                conf_threshold = float(conf_header)
+            except (ValueError, TypeError):
+                conf_threshold = None
+    # Validate and clamp confidence threshold
+    if conf_threshold is not None:
+        conf_threshold = max(0.0, min(1.0, float(conf_threshold)))
+    else:
+        conf_threshold = 0.9  # Default confidence threshold (90%)
 
     if detector is None:
         # Default to local detection model in project root
@@ -807,7 +857,7 @@ async def infer(
         raise HTTPException(status_code=400, detail=f"Could not read image: {exc}")
 
     # Run inference in a thread and guard with per-model lock for safety
-    inference = await run_in_threadpool(_run_inference_threadsafe, model_path, model, pil_image)
+    inference = await run_in_threadpool(_run_inference_threadsafe, model_path, model, pil_image, conf_threshold)
 
     # Optional product reclassification
     headers_flag = headers.get("reclassify_products") or headers.get("reclassify-products")
@@ -861,6 +911,7 @@ async def infer(
         "model_id": model_id,
         "project_id": project_id,
         "detector": detector,
+        "confidence_threshold": conf_threshold,
         "result": inference,
     }
 
@@ -1000,6 +1051,7 @@ async def review(
         qp = float(result.get("quality_percent", 0.0))
     except Exception:
         qp = 0.0
+    # Slightly boost score when only soft flags fail, capped at 100
     qp = max(0.0, min(100.0, qp))
     analysis = str(result.get("analysis", ""))
     flags = result.get("flags", {}) if isinstance(result.get("flags"), dict) else {}
@@ -1024,6 +1076,8 @@ async def review(
         if (not bool(flags.get("low_clutter"))) or (not bool(flags.get("unobstructed_products"))):
             tips.append("crop tightly to the tobacco shelves and exclude counter/people/irrelevant areas")
         advice = "good job" if not tips else ("; ".join(tips) + ". Please retake and resubmit.")
+
+    # Note: advice normalization happens after 'accepted' is computed below
 
     # Optionally produce a simple overlay marking issue regions
     overlay_b64: Optional[str] = None
@@ -1058,15 +1112,19 @@ async def review(
         logger.info("/review: overlay generated (%d bytes)", len(overlay_b64))
 
     # If image meets all requirements, count and list tobacco products on shelves
-    accepted = (
-        bool(flags.get("products_visible")) and
-        bool(flags.get("shelves_horizontal")) and
-        bool(flags.get("low_clutter")) and
-        bool(flags.get("price_tags_visible")) and
-        bool(flags.get("mostly_tobacco_products")) and
-        bool(flags.get("unobstructed_products")) and
-        bool(flags.get("straight_on_view"))
-    )
+    # Acceptance is lenient to minor issues: require core criteria and allow a single soft miss
+    core = [
+        bool(flags.get("products_visible")),
+        bool(flags.get("shelves_horizontal")),
+        bool(flags.get("low_clutter")),
+        bool(flags.get("straight_on_view")),
+    ]
+    soft = [
+        bool(flags.get("price_tags_visible")),
+        bool(flags.get("mostly_tobacco_products")),
+        bool(flags.get("unobstructed_products")),
+    ]
+    accepted = (all(core) and (sum(1 for v in soft if not v) <= 1))
 
     products_summary: Optional[Dict[str, Any]] = None
     if accepted:
@@ -1078,14 +1136,27 @@ async def review(
                 items = prod.get("by_label", []) or []
                 cleaned = []
                 for it in items:
-                    if isinstance(it, dict) and "label" in it and "count" in it:
+                    if isinstance(it, dict) and "label" in it and ("facing_count" in it or "count" in it):
                         try:
-                            cleaned.append({"label": str(it["label"]), "count": int(it["count"])})
+                            label = str(it["label"])
+                            # Prefer facing_count; fall back to count for backwards compatibility
+                            fc = it.get("facing_count", it.get("count", 0))
+                            count = int(fc)
+                            entry = {"label": label, "facing_count": count}
+                            # Bubble through manufacturer if Gemini provided it
+                            if isinstance(it.get("manufacturer"), str) and it.get("manufacturer").strip():
+                                entry["manufacturer"] = it.get("manufacturer").strip()
+                            cleaned.append(entry)
                         except Exception:
                             continue
                 products_summary = {"total_count": total, "by_label": cleaned}
         except Exception:
             products_summary = None
+
+    # If accepted but advice is overly critical, normalize to 'good job' (allow at most one soft miss)
+    if accepted and advice and advice.strip().lower() != "good job":
+        if sum(1 for k in ("price_tags_visible", "mostly_tobacco_products", "unobstructed_products") if not flags.get(k)) <= 1:
+            advice = "good job"
 
     response: Dict[str, Any] = {
         "quality_percent": qp,
@@ -1095,6 +1166,17 @@ async def review(
         **({"overlay_png_base64": overlay_b64} if overlay_b64 else {}),
         "accepted": bool(accepted),
     }
+    # Bubble up token usage if provided by Gemini
+    try:
+        tu = result.get("token_usage")
+        if isinstance(tu, dict):
+            response["token_usage"] = {
+                "input": int(tu.get("input", 0)),
+                "output": int(tu.get("output", 0)),
+                "total": int(tu.get("total", 0)),
+            }
+    except Exception:
+        pass
     if products_summary is not None:
         response["products"] = products_summary
 
@@ -1278,6 +1360,9 @@ async def upload_page():
             <label>Classifier metadata JSON (optional labels)</label>
             <input id=\"metadata\" type=\"text\" placeholder=\"e.g. axsy-classifier.json or gs://.../labels.json\" />
 
+            <label>Confidence threshold (0.0-1.0)</label>
+            <input id=\"confidence_threshold\" type=\"number\" min=\"0\" max=\"1\" step=\"0.01\" value=\"0.9\" placeholder=\"0.9\" />
+
             <div class=\"row\">
               <div>
                 <label>GCS bucket header</label>
@@ -1453,6 +1538,7 @@ async def upload_page():
             const detector = document.getElementById('detector').value.trim();
             const classifier = document.getElementById('classifier').value.trim();
             const metadata = document.getElementById('metadata').value.trim();
+            const confidence_threshold = document.getElementById('confidence_threshold').value.trim();
             const gcs_bucket = document.getElementById('gcs_bucket').value.trim();
             const customer_id = document.getElementById('customer_id').value.trim();
             const model_id = document.getElementById('model_id').value.trim();
@@ -1460,6 +1546,7 @@ async def upload_page():
             if (detector) headers['detector'] = detector;
             if (classifier) headers['classifier'] = classifier;
             if (metadata) headers['metadata'] = metadata;
+            if (confidence_threshold) headers['confidence_threshold'] = confidence_threshold;
             if (gcs_bucket) headers['gcs_bucket'] = gcs_bucket;
             if (customer_id) headers['customer_id'] = customer_id;
             if (model_id) headers['model_id'] = model_id;
