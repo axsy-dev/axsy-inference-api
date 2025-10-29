@@ -170,7 +170,12 @@ def load_classifier(
 ) -> Classifier:
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(weights_path, map_location=device)
+    
     state_dict = ckpt.get("state_dict", ckpt)
+    
+    # Handle DataParallel wrapper - remove 'module.' prefix from keys if present
+    if any(key.startswith('module.') for key in state_dict.keys()):
+        state_dict = {key.replace('module.', ''): value for key, value in state_dict.items()}
 
     # Prefer explicit configuration from JSON when available and caller didn't specify
     if inp_size is None:
@@ -207,7 +212,16 @@ def load_classifier(
     n_classes = n_classes or 35
 
     model = Classifier(n_classes=n_classes, inp_size=inp_size, device=device)
-    model.load_state_dict(state_dict)
+    
+    # Try to load the state_dict with strict=False to handle missing keys gracefully
+    try:
+        model.load_state_dict(state_dict, strict=True)
+    except RuntimeError as e:
+        # If strict loading fails, try with strict=False
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        if missing_keys:
+            raise RuntimeError(f"Cannot load classifier model: architecture mismatch. Missing keys: {missing_keys[:5]}... (and {len(missing_keys)-5} more)")
+    
     model.eval()
     return model.to(device)
 
