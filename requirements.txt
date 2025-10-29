@@ -4,3 +4,4 @@ python-multipart
 pillow
 ultralytics
 google-cloud-storage
+google-generativeai
