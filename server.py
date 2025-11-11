@@ -9,7 +9,7 @@ import base64
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile, Request, Query
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 from PIL import Image
 from ultralytics import YOLO
 try:
@@ -585,7 +585,7 @@ def _prepare_image_tensor_batch(pil_images: list[Image.Image], size: int, device
     x = torch.from_numpy(bchw).to(device, non_blocking=non_blocking)
     return x
 
-def run_yolo_inference(model: YOLO, pil_image: Image.Image, conf_threshold: float = 0.9):
+def run_yolo_inference(model: YOLO, pil_image: Image.Image, conf_threshold: float = 0.25):
     results = model(pil_image, conf=conf_threshold)
     if not results:
         return {
@@ -658,7 +658,7 @@ def run_yolo_inference(model: YOLO, pil_image: Image.Image, conf_threshold: floa
     }
 
 
-def _run_inference_threadsafe(model_path: str, model: YOLO, pil_image: Image.Image, conf_threshold: float = 0.9) -> Dict[str, Any]:
+def _run_inference_threadsafe(model_path: str, model: YOLO, pil_image: Image.Image, conf_threshold: float = 0.25) -> Dict[str, Any]:
     """Run inference under a per-model lock to ensure thread-safety.
 
     This prevents concurrent model() calls on the same model instance which
@@ -825,7 +825,7 @@ async def infer(
     if conf_threshold is not None:
         conf_threshold = max(0.0, min(1.0, float(conf_threshold)))
     else:
-        conf_threshold = 0.9  # Default confidence threshold (90%)
+        conf_threshold = 0.25  # Default confidence threshold (90%)
 
     if detector is None:
         # Default to local detection model in project root
@@ -1315,7 +1315,11 @@ async def classify_batch(
 
     return JSONResponse(content=response)
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
+async def root():
+    return RedirectResponse(url="/inferui")
+
+@app.get("/inferui", response_class=HTMLResponse)
 async def upload_page():
     html = """
     <!doctype html>
@@ -1361,7 +1365,7 @@ async def upload_page():
             <input id=\"metadata\" type=\"text\" placeholder=\"e.g. axsy-classifier.json or gs://.../labels.json\" />
 
             <label>Confidence threshold (0.0-1.0)</label>
-            <input id=\"confidence_threshold\" type=\"number\" min=\"0\" max=\"1\" step=\"0.01\" value=\"0.9\" placeholder=\"0.9\" />
+            <input id=\"confidence_threshold\" type=\"number\" min=\"0\" max=\"1\" step=\"0.1\" value=\"0.25\" placeholder=\"0.9\" />
 
             <div class=\"row\">
               <div>

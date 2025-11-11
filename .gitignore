@@ -25,12 +25,11 @@ smart-vision-trainiing-sa.json
 .env.*
 
 # Large model files
-*.pt
 *.onnx
 *.tflite
 
 # Local test assets
 *.jpg
 *.png
-axsy-classifier.json
+
 
