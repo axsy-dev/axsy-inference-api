@@ -9,7 +9,7 @@ import base64
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile, Request, Query
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 from PIL import Image
 from ultralytics import YOLO
 try:
@@ -585,7 +585,7 @@ def _prepare_image_tensor_batch(pil_images: list[Image.Image], size: int, device
     x = torch.from_numpy(bchw).to(device, non_blocking=non_blocking)
     return x
 
-def run_yolo_inference(model: YOLO, pil_image: Image.Image, conf_threshold: float = 0.9):
+def run_yolo_inference(model: YOLO, pil_image: Image.Image, conf_threshold: float = 0.25):
     results = model(pil_image, conf=conf_threshold)
     if not results:
         return {
@@ -1315,7 +1315,11 @@ async def classify_batch(
 
     return JSONResponse(content=response)
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
+async def root():
+    return RedirectResponse(url="/ui")
+
+@app.get("/ui", response_class=HTMLResponse)
 async def upload_page():
     html = """
     <!doctype html>
