@@ -21,6 +21,8 @@ set -euo pipefail
 #   INCLUDE_MODELS (default: false) - include model files in the image build context
 #   REQUIRE_SA_JSON (default: false) - require smart-vision-trainiing-sa.json to exist
 #   SERVICE_ACCOUNT_EMAIL (optional) - Cloud Run service account to run as (prefer over key file)
+#   JWT_VERIFICATION_ENABLED (default: false) - enable JWT verification on endpoints
+#   PROJECT_NAME (optional) - GCP project name for Secret Manager (defaults to PROJECT_ID)
 
 PROJECT_ID=${1:-smart-vision-training}
 REGION=${2:-europe-west1}
@@ -30,6 +32,8 @@ if [[ -z "${PROJECT_ID}" || -z "${REGION}" ]]; then
   echo "Usage: $0 <gcp_project_id> <region> <service_name>" >&2
   exit 1
 fi
+
+JWT_VERIFICATION_ENABLED=${JWT_VERIFICATION_ENABLED:-false}
 
 REPO=${REPO:-containers}
 IMAGE_TAG=${IMAGE_TAG:-latest}
@@ -49,7 +53,11 @@ ALLOW_UNAUTH=${ALLOW_UNAUTH:-true}
 REQUIRE_MODELS=${REQUIRE_MODELS:-true}
 INCLUDE_MODELS=${INCLUDE_MODELS:-true}
 REQUIRE_SA_JSON=${REQUIRE_SA_JSON:-true}
-SERVICE_ACCOUNT_EMAIL=${SERVICE_ACCOUNT_EMAIL:-}
+
+PROJECT_NAME=${PROJECT_NAME:-}
+REGION="europe-west1"
+SERVICE_ACCOUNT_EMAIL="axsy-cloud-functions@smart-vision-training.iam.gserviceaccount.com"
+
 SA_JSON="smart-vision-trainiing-sa.json"
 
 # Preflight: ensure default model files exist so the container has them at /app
@@ -69,6 +77,7 @@ if [[ "${REQUIRE_MODELS}" == "true" ]]; then
 fi
 
 # Ensure service account JSON is present so it is baked into the image and available at /app
+# This service account is used for both GCS access and Secret Manager access (shared secret pool)
 if [[ "${REQUIRE_SA_JSON}" == "true" ]]; then
   if [[ ! -f "$SA_JSON" ]]; then
     echo "ERROR: Missing required service account JSON '$SA_JSON' in project root $(pwd)." >&2
@@ -76,6 +85,7 @@ if [[ "${REQUIRE_SA_JSON}" == "true" ]]; then
     exit 1
   fi
   echo "Found service account JSON: $SA_JSON"
+  echo "Note: This service account will be used to access Secret Manager for JWT public key (shared secret pool)"
 fi
 
 # Ensure repo exists
@@ -121,6 +131,17 @@ printf "\n==> Deploying Cloud Run service %s in %s\n" "$SERVICE" "$REGION"
 ENV_VARS="UVICORN_WORKERS=${UVICORN_WORKERS},UVICORN_LOG_LEVEL=${UVICORN_LOG_LEVEL}"
 if [[ "${REQUIRE_SA_JSON}" == "true" ]]; then
   ENV_VARS="GOOGLE_APPLICATION_CREDENTIALS=/app/${SA_JSON},${ENV_VARS}"
+fi
+# Add JWT verification enabled flag and project name for Secret Manager
+if [[ "${JWT_VERIFICATION_ENABLED}" == "true" ]]; then
+  ENV_VARS="JWT_VERIFICATION_ENABLED=true,${ENV_VARS}"
+  # Set PROJECT_NAME for Secret Manager access (uses shared secret pool)
+  # If PROJECT_NAME env var is set, use it; otherwise use PROJECT_ID
+  if [[ -n "${PROJECT_NAME}" ]]; then
+    ENV_VARS="PROJECT_NAME=${PROJECT_NAME},${ENV_VARS}"
+  else
+    ENV_VARS="PROJECT_NAME=${PROJECT_ID},${ENV_VARS}"
+  fi
 fi
 ARGS=(
   --project="$PROJECT_ID"

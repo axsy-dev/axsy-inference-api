@@ -7,9 +7,10 @@ import logging
 from typing import Any, Dict, Optional, List
 import base64
 
-from fastapi import FastAPI, File, Header, HTTPException, UploadFile, Request, Query
+from fastapi import FastAPI, File, Header, HTTPException, UploadFile, Request, Query, Depends
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from PIL import Image
 from ultralytics import YOLO
 try:
@@ -22,6 +23,55 @@ app = FastAPI(title="Axsy Inference API")
 
 # Logger
 logger = logging.getLogger("uvicorn.error")
+
+# JWT Authentication
+security = HTTPBearer(auto_error=False)
+
+# Import authentication module
+try:
+    from authentication import verify_jwt_token, JWT_VERIFICATION_ENABLED
+    JWT_ENABLED = JWT_VERIFICATION_ENABLED
+except ImportError:
+    logger.warning("JWT authentication module not available")
+    JWT_ENABLED = False
+    verify_jwt_token = None
+
+
+async def verify_jwt_dependency(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+) -> Optional[Dict[str, Any]]:
+    """FastAPI dependency to verify JWT token from Authorization header.
+    
+    Returns the decoded token payload if valid, raises HTTPException if invalid.
+    If JWT is disabled or no credentials provided, returns None.
+    """
+    if not JWT_ENABLED:
+        return None
+    
+    if not credentials:
+        raise HTTPException(
+            status_code=401,
+            detail="FORBIDDEN: Authorization header not provided"
+        )
+    
+    token = credentials.credentials
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="FORBIDDEN: Bearer token is required"
+        )
+    
+    try:
+        logger.debug("JWT token present. Proceeding to verification...")
+        decoded = await verify_jwt_token(token)
+        logger.debug("Token successfully verified. Proceeding to endpoint.")
+        return decoded
+    except ValueError as e:
+        logger.warning(f"JWT verification failed: {e}")
+        raise HTTPException(status_code=401, detail=str(e))
+    except Exception as e:
+        logger.error(f"JWT verification error: {e}")
+        raise HTTPException(status_code=401, detail="Invalid token")
 
 # Global locks for concurrency safety
 _global_lock = threading.Lock()
@@ -789,6 +839,7 @@ def _reclassify_products(
 @app.post("/infer")
 async def infer(
     request: Request,
+    token_data: Optional[Dict[str, Any]] = Depends(verify_jwt_dependency),
     file: Optional[UploadFile] = File(default=None, description="Image file to classify"),
     image: Optional[UploadFile] = File(default=None, description="Alternative field name for the image"),
     customer_id: Optional[str] = Header(default=None),
@@ -921,6 +972,7 @@ async def infer(
 @app.post("/classify")
 async def classify(
     request: Request,
+    token_data: Optional[Dict[str, Any]] = Depends(verify_jwt_dependency),
     file: Optional[UploadFile] = File(default=None, description="Image file to classify"),
     image: Optional[UploadFile] = File(default=None, description="Alternative field name for the image"),
     customer_id: Optional[str] = Header(default=None),
@@ -1008,6 +1060,7 @@ async def classify(
 @app.post("/review")
 async def review(
     request: Request,
+    token_data: Optional[Dict[str, Any]] = Depends(verify_jwt_dependency),
     file: Optional[UploadFile] = File(default=None, description="Image file to review"),
     image: Optional[UploadFile] = File(default=None, description="Alternative field name for the image"),
     gemini_api_key: Optional[str] = Header(default=None, description="API key for Gemini (optional; defaults to env GEMINI_API_KEY)"),
@@ -1186,6 +1239,7 @@ async def review(
 @app.post("/classify_batch")
 async def classify_batch(
     request: Request,
+    token_data: Optional[Dict[str, Any]] = Depends(verify_jwt_dependency),
     files: Optional[list[UploadFile]] = File(default=None, description="List of image files to classify"),
     customer_id: Optional[str] = Header(default=None),
     model_id: Optional[str] = Header(default=None),
