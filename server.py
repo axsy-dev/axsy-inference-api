@@ -1317,9 +1317,9 @@ async def classify_batch(
 
 @app.get("/")
 async def root():
-    return RedirectResponse(url="/ui")
+    return RedirectResponse(url="/inferui")
 
-@app.get("/ui", response_class=HTMLResponse)
+@app.get("/inferui", response_class=HTMLResponse)
 async def upload_page():
     html = """
     <!doctype html>
