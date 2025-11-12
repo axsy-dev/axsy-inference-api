@@ -1,5 +1,6 @@
 """JWT authentication module for Axsy Inference API."""
 import os
+import json
 import logging
 from functools import lru_cache
 from typing import Optional, Dict, Any
@@ -7,6 +8,7 @@ from typing import Optional, Dict, Any
 import jwt
 from google.cloud import secretmanager
 from google.auth import default
+from google.oauth2 import service_account
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -15,12 +17,27 @@ JWT_VERIFICATION_ENABLED = os.getenv("JWT_VERIFICATION_ENABLED", "false").lower(
 
 
 def get_project_id() -> str:
-    """Get the GCP project ID from environment or default credentials."""
+    """Get the GCP project ID from environment, service account key, or default credentials."""
     project_id = os.getenv("PROJECT_ID") or os.getenv("GCP_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT")
     if project_id:
         logger.debug(f"Project ID from env: {project_id}")
         return project_id
     
+    # Try to get project ID from service account key in Secret Manager
+    # Use env vars to avoid circular dependency with get_project_id()
+    try:
+        logger.debug("Fetching project ID from service account key in Secret Manager...")
+        # Get project from env vars first to avoid circular dependency
+        temp_project = get_project_name() or os.getenv("PROJECT_ID") or os.getenv("GCP_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT") or "smart-vision-training"
+        sa_key_dict = get_service_account_key_sync(project=temp_project)
+        project_id = sa_key_dict.get("project_id")
+        if project_id:
+            logger.debug(f"Project ID from service account key: {project_id}")
+            return project_id
+    except Exception as e:
+        logger.debug(f"Could not get project ID from Secret Manager: {e}")
+    
+    # Fallback to default credentials
     try:
         logger.debug("Fetching project ID using GoogleAuth...")
         _, project_id = default()
@@ -111,4 +128,61 @@ def get_jwt_public_key_sync() -> str:
     except Exception as e:
         logger.error(f"Failed to get JWT public key from Secret Manager: {e}")
         raise
+
+
+def get_service_account_key_sync(project: Optional[str] = None) -> Dict[str, Any]:
+    """Get the service account key from Secret Manager.
+    
+    Args:
+        project: Optional project ID/name. If not provided, will try to get from env vars
+                or use default. Avoids calling get_project_id() to prevent circular dependency.
+    
+    Returns:
+        Service account key as a dictionary (JSON parsed)
+        
+    Raises:
+        Exception: If the secret cannot be retrieved or parsed
+    """
+    if not project:
+        # Try to get project from env vars first to avoid circular dependency
+        project = get_project_name() or os.getenv("PROJECT_ID") or os.getenv("GCP_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT") or "smart-vision-training"
+    
+    logger.debug(f"Getting service account key from Secret Manager for project: {project}")
+    
+    try:
+        client = _get_secret_manager_client()
+        secret_name = f"projects/{project}/secrets/service_account_key/versions/latest"
+        
+        response = client.access_secret_version(request={"name": secret_name})
+        sa_key_json = response.payload.data.decode("utf-8")
+        sa_key_dict = json.loads(sa_key_json)
+        logger.debug("Successfully retrieved service account key from Secret Manager")
+        return sa_key_dict
+    except Exception as e:
+        logger.error(f"Failed to get service account key from Secret Manager: {e}")
+        raise
+
+
+@lru_cache(maxsize=1)
+def get_google_credentials():
+    """Get Google Auth credentials, preferring service account key from Secret Manager.
+    
+    This function caches the credentials to avoid repeated Secret Manager calls.
+    Falls back to default credentials if Secret Manager access fails.
+    """
+    # First, try to get service account key from Secret Manager
+    try:
+        sa_key_dict = get_service_account_key_sync()
+        credentials = service_account.Credentials.from_service_account_info(sa_key_dict)
+        logger.debug("Using service account credentials from Secret Manager")
+        return credentials
+    except Exception as e:
+        logger.warning(f"Could not get service account key from Secret Manager: {e}. Falling back to default credentials.")
+        try:
+            credentials, _ = default()
+            logger.debug("Using default application credentials")
+            return credentials
+        except Exception as e2:
+            logger.error(f"Failed to get default credentials: {e2}")
+            raise
 

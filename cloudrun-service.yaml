@@ -12,8 +12,6 @@ spec:
       containers:
         - image: europe-west1-docker.pkg.dev/smart-vision-training/containers/axsy-inference:latest
           env:
-            - name: GOOGLE_APPLICATION_CREDENTIALS
-              value: /app/smart-vision-trainiing-sa.json
             - name: UVICORN_WORKERS
               value: "1"
             - name: UVICORN_LOG_LEVEL

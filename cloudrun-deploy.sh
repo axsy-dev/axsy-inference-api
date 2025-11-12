@@ -20,6 +20,8 @@ set -euo pipefail
 #   REQUIRE_MODELS (default: false) - require axsy-yolo.pt and axsy-classifier.pt to exist
 #   INCLUDE_MODELS (default: false) - include model files in the image build context
 #   REQUIRE_SA_JSON (default: false) - require smart-vision-trainiing-sa.json to exist
+#     Note: Service account key is now fetched from Secret Manager (service_account_key secret)
+#     This option is only needed for local development or if not using Secret Manager
 #   SERVICE_ACCOUNT_EMAIL (optional) - Cloud Run service account to run as (prefer over key file)
 #   JWT_VERIFICATION_ENABLED (default: false) - enable JWT verification on endpoints
 #   PROJECT_NAME (optional) - GCP project name for Secret Manager (defaults to PROJECT_ID)
@@ -33,7 +35,7 @@ if [[ -z "${PROJECT_ID}" || -z "${REGION}" ]]; then
   exit 1
 fi
 
-JWT_VERIFICATION_ENABLED=${JWT_VERIFICATION_ENABLED:-false}
+JWT_VERIFICATION_ENABLED=${JWT_VERIFICATION_ENABLED:-true}
 
 REPO=${REPO:-containers}
 IMAGE_TAG=${IMAGE_TAG:-latest}
@@ -52,7 +54,7 @@ CPU_THROTTLING=${CPU_THROTTLING:-false}
 ALLOW_UNAUTH=${ALLOW_UNAUTH:-true}
 REQUIRE_MODELS=${REQUIRE_MODELS:-true}
 INCLUDE_MODELS=${INCLUDE_MODELS:-true}
-REQUIRE_SA_JSON=${REQUIRE_SA_JSON:-true}
+REQUIRE_SA_JSON=${REQUIRE_SA_JSON:-false}
 
 PROJECT_NAME=${PROJECT_NAME:-}
 REGION="europe-west1"
@@ -76,8 +78,9 @@ if [[ "${REQUIRE_MODELS}" == "true" ]]; then
   echo "Found default models:"; ls -lh axsy-yolo.pt axsy-classifier.pt
 fi
 
-# Ensure service account JSON is present so it is baked into the image and available at /app
-# This service account is used for both GCS access and Secret Manager access (shared secret pool)
+# Ensure service account JSON is present if REQUIRE_SA_JSON is true
+# Note: By default, the service account key is fetched from Secret Manager (service_account_key secret)
+# This check is only needed for local development or legacy deployments
 if [[ "${REQUIRE_SA_JSON}" == "true" ]]; then
   if [[ ! -f "$SA_JSON" ]]; then
     echo "ERROR: Missing required service account JSON '$SA_JSON' in project root $(pwd)." >&2
@@ -85,7 +88,9 @@ if [[ "${REQUIRE_SA_JSON}" == "true" ]]; then
     exit 1
   fi
   echo "Found service account JSON: $SA_JSON"
-  echo "Note: This service account will be used to access Secret Manager for JWT public key (shared secret pool)"
+  echo "Note: This service account will be baked into the image. For production, use Secret Manager instead."
+else
+  echo "Note: Service account key will be fetched from Secret Manager (service_account_key secret)"
 fi
 
 # Ensure repo exists
@@ -128,10 +133,9 @@ rm -f "$TMP_GCLOUDIGNORE"
 # Deploy to Cloud Run
 printf "\n==> Deploying Cloud Run service %s in %s\n" "$SERVICE" "$REGION"
 # Prepare env vars block
+# Note: Service account key is now fetched from Secret Manager (service_account_key secret)
+# instead of using GOOGLE_APPLICATION_CREDENTIALS file path
 ENV_VARS="UVICORN_WORKERS=${UVICORN_WORKERS},UVICORN_LOG_LEVEL=${UVICORN_LOG_LEVEL}"
-if [[ "${REQUIRE_SA_JSON}" == "true" ]]; then
-  ENV_VARS="GOOGLE_APPLICATION_CREDENTIALS=/app/${SA_JSON},${ENV_VARS}"
-fi
 # Add JWT verification enabled flag and project name for Secret Manager
 if [[ "${JWT_VERIFICATION_ENABLED}" == "true" ]]; then
   ENV_VARS="JWT_VERIFICATION_ENABLED=true,${ENV_VARS}"

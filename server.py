@@ -487,6 +487,18 @@ def _ensure_storage_client(project_id: Optional[str] = None) -> "storage.Client"
             ),
         )
     try:
+        # First, try to get credentials from Secret Manager via authentication module
+        try:
+            from authentication import get_google_credentials
+            credentials = get_google_credentials()
+            logger.info("GCS: using credentials from Secret Manager")
+            return storage.Client(credentials=credentials, project=project_id)
+        except ImportError:
+            logger.warning("GCS: authentication module not available, falling back to file-based credentials")
+        except Exception as exc:
+            logger.warning(f"GCS: Failed to get credentials from Secret Manager: {exc}, falling back to file-based credentials")
+        
+        # Fallback: try file-based credentials if Secret Manager fails
         creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
         if creds_path:
             try:
@@ -497,21 +509,21 @@ def _ensure_storage_client(project_id: Optional[str] = None) -> "storage.Client"
             if exists:
                 try:
                     # Prefer explicit JSON when present
-                    return storage.Client.from_service_account_json(creds_path)
+                    return storage.Client.from_service_account_json(creds_path, project=project_id)
                 except Exception as exc:
                     logger.exception("GCS: Failed to init client from JSON %s: %s; falling back to ADC", creds_path, exc)
             # If path is missing or failed to load, ensure env var does not force google.auth to try it
             logger.warning("GCS: credentials file path does not exist or failed, clearing env and using ADC: %s", creds_path)
             prev = os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
             try:
-                return storage.Client()
+                return storage.Client(project=project_id)
             finally:
                 if prev is not None:
                     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = prev
         else:
             logger.info("GCS: GOOGLE_APPLICATION_CREDENTIALS not set; using default application credentials")
         # Always rely on credentials' default project to avoid header mismatch
-        return storage.Client()
+        return storage.Client(project=project_id)
     except Exception as exc:
         logger.exception("GCS: Failed to init storage client: %s", exc)
         raise HTTPException(status_code=500, detail=f"Failed to init GCS client: {exc}")
