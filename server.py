@@ -7,9 +7,10 @@ import logging
 from typing import Any, Dict, Optional, List
 import base64
 
-from fastapi import FastAPI, File, Header, HTTPException, UploadFile, Request, Query
+from fastapi import FastAPI, File, Header, HTTPException, UploadFile, Request, Query, Depends
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from PIL import Image
 from ultralytics import YOLO
 try:
@@ -22,6 +23,55 @@ app = FastAPI(title="Axsy Inference API")
 
 # Logger
 logger = logging.getLogger("uvicorn.error")
+
+# JWT Authentication
+security = HTTPBearer(auto_error=False)
+
+# Import authentication module
+try:
+    from authentication import verify_jwt_token, JWT_VERIFICATION_ENABLED
+    JWT_ENABLED = JWT_VERIFICATION_ENABLED
+except ImportError:
+    logger.warning("JWT authentication module not available")
+    JWT_ENABLED = False
+    verify_jwt_token = None
+
+
+async def verify_jwt_dependency(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+) -> Optional[Dict[str, Any]]:
+    """FastAPI dependency to verify JWT token from Authorization header.
+    
+    Returns the decoded token payload if valid, raises HTTPException if invalid.
+    If JWT is disabled or no credentials provided, returns None.
+    """
+    if not JWT_ENABLED:
+        return None
+    
+    if not credentials:
+        raise HTTPException(
+            status_code=401,
+            detail="FORBIDDEN: Authorization header not provided"
+        )
+    
+    token = credentials.credentials
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="FORBIDDEN: Bearer token is required"
+        )
+    
+    try:
+        logger.debug("JWT token present. Proceeding to verification...")
+        decoded = await verify_jwt_token(token)
+        logger.debug("Token successfully verified. Proceeding to endpoint.")
+        return decoded
+    except ValueError as e:
+        logger.warning(f"JWT verification failed: {e}")
+        raise HTTPException(status_code=401, detail=str(e))
+    except Exception as e:
+        logger.error(f"JWT verification error: {e}")
+        raise HTTPException(status_code=401, detail="Invalid token")
 
 # Global locks for concurrency safety
 _global_lock = threading.Lock()
@@ -437,6 +487,18 @@ def _ensure_storage_client(project_id: Optional[str] = None) -> "storage.Client"
             ),
         )
     try:
+        # First, try to get credentials from Secret Manager via authentication module
+        try:
+            from authentication import get_google_credentials
+            credentials = get_google_credentials()
+            logger.info("GCS: using credentials from Secret Manager")
+            return storage.Client(credentials=credentials, project=project_id)
+        except ImportError:
+            logger.warning("GCS: authentication module not available, falling back to file-based credentials")
+        except Exception as exc:
+            logger.warning(f"GCS: Failed to get credentials from Secret Manager: {exc}, falling back to file-based credentials")
+        
+        # Fallback: try file-based credentials if Secret Manager fails
         creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
         if creds_path:
             try:
@@ -447,21 +509,21 @@ def _ensure_storage_client(project_id: Optional[str] = None) -> "storage.Client"
             if exists:
                 try:
                     # Prefer explicit JSON when present
-                    return storage.Client.from_service_account_json(creds_path)
+                    return storage.Client.from_service_account_json(creds_path, project=project_id)
                 except Exception as exc:
                     logger.exception("GCS: Failed to init client from JSON %s: %s; falling back to ADC", creds_path, exc)
             # If path is missing or failed to load, ensure env var does not force google.auth to try it
             logger.warning("GCS: credentials file path does not exist or failed, clearing env and using ADC: %s", creds_path)
             prev = os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
             try:
-                return storage.Client()
+                return storage.Client(project=project_id)
             finally:
                 if prev is not None:
                     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = prev
         else:
             logger.info("GCS: GOOGLE_APPLICATION_CREDENTIALS not set; using default application credentials")
         # Always rely on credentials' default project to avoid header mismatch
-        return storage.Client()
+        return storage.Client(project=project_id)
     except Exception as exc:
         logger.exception("GCS: Failed to init storage client: %s", exc)
         raise HTTPException(status_code=500, detail=f"Failed to init GCS client: {exc}")
@@ -789,6 +851,7 @@ def _reclassify_products(
 @app.post("/infer")
 async def infer(
     request: Request,
+    token_data: Optional[Dict[str, Any]] = Depends(verify_jwt_dependency),
     file: Optional[UploadFile] = File(default=None, description="Image file to classify"),
     image: Optional[UploadFile] = File(default=None, description="Alternative field name for the image"),
     customer_id: Optional[str] = Header(default=None),
@@ -921,6 +984,7 @@ async def infer(
 @app.post("/classify")
 async def classify(
     request: Request,
+    token_data: Optional[Dict[str, Any]] = Depends(verify_jwt_dependency),
     file: Optional[UploadFile] = File(default=None, description="Image file to classify"),
     image: Optional[UploadFile] = File(default=None, description="Alternative field name for the image"),
     customer_id: Optional[str] = Header(default=None),
@@ -1008,6 +1072,7 @@ async def classify(
 @app.post("/review")
 async def review(
     request: Request,
+    token_data: Optional[Dict[str, Any]] = Depends(verify_jwt_dependency),
     file: Optional[UploadFile] = File(default=None, description="Image file to review"),
     image: Optional[UploadFile] = File(default=None, description="Alternative field name for the image"),
     gemini_api_key: Optional[str] = Header(default=None, description="API key for Gemini (optional; defaults to env GEMINI_API_KEY)"),
@@ -1186,6 +1251,7 @@ async def review(
 @app.post("/classify_batch")
 async def classify_batch(
     request: Request,
+    token_data: Optional[Dict[str, Any]] = Depends(verify_jwt_dependency),
     files: Optional[list[UploadFile]] = File(default=None, description="List of image files to classify"),
     customer_id: Optional[str] = Header(default=None),
     model_id: Optional[str] = Header(default=None),

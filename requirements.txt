@@ -5,3 +5,6 @@ pillow
 ultralytics
 google-cloud-storage
 google-generativeai
+google-cloud-secret-manager
+pyjwt
+cryptography
