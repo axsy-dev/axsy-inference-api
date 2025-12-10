@@ -11,6 +11,8 @@ from fastapi import FastAPI, File, Header, HTTPException, UploadFile, Request, Q
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
 from PIL import Image
 from ultralytics import YOLO
 try:
@@ -23,6 +25,38 @@ app = FastAPI(title="Axsy Inference API")
 
 # Logger
 logger = logging.getLogger("uvicorn.error")
+
+
+class RequestLoggingMiddleware(BaseHTTPMiddleware):
+    """Middleware to log full inbound request URLs and headers for debugging."""
+    
+    async def dispatch(self, request: StarletteRequest, call_next):
+        # Build full URL with query parameters
+        url = str(request.url)
+        
+        # Log relevant headers (excluding sensitive ones)
+        relevant_headers = {}
+        sensitive_headers = {"authorization", "cookie", "x-api-key"}
+        
+        for key, value in request.headers.items():
+            key_lower = key.lower()
+            if key_lower in sensitive_headers:
+                # Log presence but mask the value
+                relevant_headers[key] = f"<masked ({len(value)} chars)>" if value else None
+            else:
+                relevant_headers[key] = value
+        
+        logger.info(
+            f"Request: {request.method} {url} | "
+            f"Headers: {json.dumps(relevant_headers, indent=2)}"
+        )
+        
+        response = await call_next(request)
+        return response
+
+
+# Add request logging middleware
+app.add_middleware(RequestLoggingMiddleware)
 
 # JWT Authentication
 security = HTTPBearer(auto_error=False)
