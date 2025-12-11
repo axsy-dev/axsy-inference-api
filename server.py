@@ -862,10 +862,10 @@ def _reclassify_products(
             det = detections[det_idx]
             det["classifier_id"] = idx_val
             if labels and 0 <= idx_val < len(labels):
-                det["class_name"] = labels[idx_val]
+                det["classifier_label"] = labels[idx_val]
             elif labels:
-                det["class_name"] = labels[0]
-            det["confidence"] = float(prob_val if prob_val else det.get("confidence", 0.0))
+                det["classifier_label"] = labels[0]
+            det["classifier_confidence"] = float(prob_val if prob_val else 0.0)
 
         t3 = perf_counter()
         total_pre_ms = float((t1 - t0) * 1000.0)
